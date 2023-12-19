@@ -5,14 +5,55 @@ import "net"
 import "os"
 import "net/rpc"
 import "net/http"
-
+import "sync"
 
 type Coordinator struct {
 	// Your definitions here.
-
+	mapf func(string, string) []KeyValue
+	reducef func(string, []string) string
+	nMap int
+	mapTasks []TaskStatus
+	nReduce int
+	reduceTasks []TaskStatus
+	currentStage int 
+	workerTracker WorkerTracker
+	mu sync.mutex	
 }
-
+type WorkerTracker struct{
+	nWorker int
+	exited []bool
+	nExitedWorker int
+}
+type TaskTracker struct{
+	mu sync.mutex
+	nTask int
+	tasks []Task
+	taskStatus []TaskStatus
+	unscheduledTasks []int
+	nFinishedTask int	
+}
+type TaskStatus struct{
+	taskId int	
+	task Task
+	state int
+	startTime time.Time
+	workerId int 
+}
+type Task interface{
+	doTask(Worker) error
+}
+type ExitTask struct{
+}
+type MapTask struct{
+	taskId int
+	filename string
+}
+type ReduceTask struct{
+	taskId int
+	numOfFiles int
+}
 // Your code here -- RPC handlers for the worker to call.
+
 
 //
 // an example RPC handler.
