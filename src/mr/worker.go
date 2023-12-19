@@ -78,17 +78,27 @@ func CallRegisterWorker() *WorkerInfo {
 		return nil
 	}
 }
-func CallRequestTask(worker WorkerInfo) *Task {
+func CallRequestTask(worker *WorkerInfo) *Task {
 	args := RequestArgs{worker.workerId}
-	reply := RequestReply{nil}
+	reply := RequestReply{}
 	ok := call("Coordinator.RequestTask", &args, &reply)
 	if !ok {
 		log.Fatalf("worker %d fail to receive a task!\n", worker.workerId)
 		return nil
 	}
-	fmt.Printf("worker %d received the task %d with type %d",
-		worker.workerId, reply.task.taskId, reply.task.taskType)
+	log.Printf("worker %d received the task %d with type %d\n",
+		worker.workerId, reply.task.TaskId, reply.task.Type)
 	return reply.task
+}
+func CallTaskFinished(worker *WorkerInfo, task *Task) {
+	args := FinishedArgs{worker.workerId, task.TaskId, task.Type} // type is needed to avoid confusion from network delay
+	reply := FinishedReply{}
+	ok := call("Coordinator.TaskFinished", &args, &reply)
+	if !ok {
+		log.Fatalf("worker %d fail to inform task %d finished!\n", worker.workerId, task.TaskId)
+		return
+	}
+	log.Printf("The finish of task %d by worker %d has been informed to coordinator\n", task.TaskId, worker.workerId)
 }
 
 // send an RPC request to the coordinator, wait for the response.

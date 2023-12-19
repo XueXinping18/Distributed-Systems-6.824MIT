@@ -36,6 +36,13 @@ type RequestArgs struct {
 type RequestReply struct {
 	task *Task
 }
+type FinishedArgs struct {
+	workerId int
+	taskId   int
+	taskType TaskType
+}
+type FinishedReply struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

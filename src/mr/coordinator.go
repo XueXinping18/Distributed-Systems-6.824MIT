@@ -24,6 +24,18 @@ const (
 	FINISHED
 )
 
+func (t TaskType) String() string {
+	switch t {
+	case 0:
+		return "MAP"
+	case 1:
+		return "REDUCE"
+	case 2:
+		return "EXIT"
+	}
+	return "UNKNOWN"
+}
+
 type Coordinator struct {
 	mapTaskTracker    TaskTracker
 	reduceTaskTracker TaskTracker
@@ -39,6 +51,7 @@ type WorkerTracker struct {
 	nExitedWorker int
 }
 type TaskTracker struct {
+	taskType       TaskType
 	nTask          int
 	tasks          []Task
 	taskToSchedule chan int
@@ -55,10 +68,10 @@ type TaskStatus struct {
 }
 
 type Task struct {
-	taskType   TaskType // MAP | REDUCE | EXIT
-	taskId     int
-	filename   string // only used by MAP type
-	numOfFiles int    // only used by REDUCE type
+	Type       TaskType // MAP | REDUCE | EXIT
+	TaskId     int
+	Filename   string // only used by MAP type
+	NumOfFiles int    // only used by REDUCE type
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -76,6 +89,8 @@ func (c *Coordinator) RegisterWorker(args *RegisterArgs, reply *RegisterReply) e
 	c.workerTracker.mu.Lock()
 	reply.workerId = c.workerTracker.nWorker
 	c.workerTracker.nWorker++
+	c.workerTracker.exited = append(c.workerTracker.exited, false)
+	log.Printf("Worker id %d assigned.\n", reply.workerId)
 	return nil
 }
 func (c *Coordinator) RequestTask(args *RequestArgs, reply *RequestReply) error {
@@ -87,7 +102,7 @@ func (c *Coordinator) RequestTask(args *RequestArgs, reply *RequestReply) error 
 		reply.task = &mapTask
 		// update task status atomically
 		updateTaskStatusPostAssignment(&c.mapTaskTracker, args.workerId, taskId)
-		log.Printf("Map request %d scheduled to worker %d!", taskId, args.workerId)
+		log.Printf("Map request %d scheduled to worker %d!\n", taskId, args.workerId)
 		return nil
 	}
 	// map channel is closed, attempt to read from Reduce channel
@@ -98,23 +113,73 @@ func (c *Coordinator) RequestTask(args *RequestArgs, reply *RequestReply) error 
 		reply.task = &reduceTask
 		// update task status atomically
 		updateTaskStatusPostAssignment(&c.reduceTaskTracker, args.workerId, taskId)
-		log.Printf("Reduce request %d scheduled to worker %d!", taskId, args.workerId)
+		log.Printf("Reduce request %d scheduled to worker %d!\n", taskId, args.workerId)
 		return nil
 	}
 	// Both channels closed, the job is done, exit
-	reply.task = &Task{taskType: EXIT}
-	log.Printf("Inform worker %d to exit!", args.workerId)
+	reply.task = &Task{Type: EXIT}
+	log.Printf("Inform worker %d to exit!\n", args.workerId)
 	return nil
+}
+
+// finish a task, update the status
+func (c *Coordinator) TaskFinished(args *FinishedArgs, reply *FinishedReply) error {
+	if args.taskType != c.currentStage {
+		log.Fatalf("Mismatch between current stage "+c.currentStage.String()+
+			" and the task type "+args.taskType.String()+" reported by worker %d\n", args.workerId)
+		return os.ErrInvalid
+	}
+	switch args.taskType {
+	case MAP:
+		finished := updateTaskStatusPostFinish(&c.mapTaskTracker, args.taskId, args.workerId)
+		if finished {
+			// Set stage first, close the channel next because longer blocking does no harm while start to read
+			// new channel before the stage flags are set might be problematic
+			c.currentStage = REDUCE
+			close(c.mapTaskTracker.taskToSchedule)
+			log.Println("The MAP stage has been completed. Next: REDUCE")
+		}
+	case REDUCE:
+		finished := updateTaskStatusPostFinish(&c.reduceTaskTracker, args.taskId, args.workerId)
+		if finished {
+			c.currentStage = EXIT
+			close(c.reduceTaskTracker.taskToSchedule)
+			log.Println("The REDUCE stage has been completed. Next: EXIT")
+		}
+	default:
+		log.Fatalf("Bad task type reported being finished: " + args.taskType.String() + "\n")
+		return os.ErrInvalid
+	}
+	return nil
+}
+
+// update the task status atomically after a task is finished, return true if the stage is also finished
+func updateTaskStatusPostFinish(taskTracker *TaskTracker, taskId int, workerId int) bool {
+	defer taskTracker.mu.Unlock()
+	taskTracker.mu.Lock()
+	taskStatus := &taskTracker.taskStatus[taskId]
+	if taskStatus.state == FINISHED {
+		log.Printf("Task %d of stage "+taskTracker.taskType.String()+
+			" finished again and ignored by coordinator", taskId)
+		return false
+	}
+	taskTracker.nFinishedTask++
+	taskStatus.state = FINISHED
+	taskStatus.workerId = workerId
+	if taskTracker.nFinishedTask == taskTracker.nTask {
+		return true
+	}
+	return false
 }
 
 // atomically update the task status after the task is assigned to a worker
 func updateTaskStatusPostAssignment(taskTracker *TaskTracker, workerId int, taskId int) {
+	defer taskTracker.mu.Unlock()
 	taskTracker.mu.Lock()
 	taskStatus := &taskTracker.taskStatus[taskId]
 	taskStatus.startTime = time.Now()
 	taskStatus.state = ONGOING
 	taskStatus.workerId = workerId
-	taskTracker.mu.Unlock()
 }
 
 // start a thread that listens for RPCs from worker.go
