@@ -1,48 +1,44 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
 
-
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
+type WorkerInfo struct {
+	workerId int
+	mapf     func(string, string) []KeyValue
+	reducef  func(string, []string) string
+}
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
 }
 
-//
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
-//
 func CallExample() {
 
 	// declare an argument structure.
@@ -67,11 +63,37 @@ func CallExample() {
 	}
 }
 
-//
+// register the worker to receive a worker id
+func CallRegisterWorker() *WorkerInfo {
+	args := RegisterArgs{}
+	reply := RegisterReply{}
+	ok := call("Coordinator.RegisterWorker", &args, &reply)
+	if ok {
+		worker := new(WorkerInfo)
+		worker.workerId = reply.workerId
+		log.Printf("register the worker with id %d\n", reply.workerId)
+		return worker
+	} else {
+		log.Fatalf("fail to register the worker!\n")
+		return nil
+	}
+}
+func CallRequestTask(worker WorkerInfo) *Task {
+	args := RequestArgs{worker.workerId}
+	reply := RequestReply{nil}
+	ok := call("Coordinator.RequestTask", &args, &reply)
+	if !ok {
+		log.Fatalf("worker %d fail to receive a task!\n", worker.workerId)
+		return nil
+	}
+	fmt.Printf("worker %d received the task %d with type %d",
+		worker.workerId, reply.task.taskId, reply.task.taskType)
+	return reply.task
+}
+
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()

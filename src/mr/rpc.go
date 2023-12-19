@@ -22,8 +22,20 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+// declare arguments and reply for registering the worker to the coordinator
+type RegisterArgs struct {
+}
+type RegisterReply struct {
+	workerId int
+}
 
+// declare arguments and reply for request a new task
+type RequestArgs struct {
+	workerId int
+}
+type RequestReply struct {
+	task *Task
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
