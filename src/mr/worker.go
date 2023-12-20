@@ -26,7 +26,7 @@ type KeyValue struct {
 }
 
 type WorkerInfo struct {
-	workerId int
+	WorkerId int
 	mapf     func(string, string) []KeyValue
 	reducef  func(string, []string) string
 }
@@ -191,7 +191,7 @@ func CallRegisterWorker() (*WorkerInfo, error) {
 	ok := call("Coordinator.RegisterWorker", &args, &reply)
 	if ok {
 		worker := new(WorkerInfo)
-		worker.workerId = reply.workerId
+		worker.WorkerId = reply.workerId
 		log.Printf("register the worker with id %d\n", reply.workerId)
 		return worker, nil
 	} else {
@@ -200,26 +200,26 @@ func CallRegisterWorker() (*WorkerInfo, error) {
 	}
 }
 func CallRequestTask(worker *WorkerInfo) (*Task, error) {
-	args := RequestArgs{worker.workerId}
+	args := RequestArgs{worker.WorkerId}
 	reply := RequestReply{}
 	ok := call("Coordinator.RequestTask", &args, &reply)
 	if !ok {
-		log.Fatalf("worker %d fail to receive a task!\n", worker.workerId)
+		log.Fatalf("worker %d fail to receive a task!\n", worker.WorkerId)
 		return nil, errors.New("Failure to communicate!")
 	}
 	fmt.Printf("worker %d received the task %d with type %d",
-		worker.workerId, reply.task.TaskId, reply.task.Type)
+		worker.WorkerId, reply.task.TaskId, reply.task.Type)
 	return reply.task, nil
 }
 func CallTaskFinished(worker *WorkerInfo, task *Task) error {
-	args := FinishedArgs{worker.workerId, task.TaskId, task.Type} // type is needed to avoid confusion from network delay
+	args := FinishedArgs{worker.WorkerId, task.TaskId, task.Type} // type is needed to avoid confusion from network delay
 	reply := FinishedReply{}
 	ok := call("Coordinator.TaskFinished", &args, &reply)
 	if !ok {
-		log.Fatalf("worker %d fail to inform task %d finished!\n", worker.workerId, task.TaskId)
+		log.Fatalf("worker %d fail to inform task %d finished!\n", worker.WorkerId, task.TaskId)
 		return nil
 	}
-	log.Printf("The finish of task %d by worker %d has been informed to coordinator\n", task.TaskId, worker.workerId)
+	log.Printf("The finish of task %d by worker %d has been informed to coordinator\n", task.TaskId, worker.WorkerId)
 	return nil
 }
 

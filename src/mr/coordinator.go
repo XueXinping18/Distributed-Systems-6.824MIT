@@ -23,7 +23,11 @@ const (
 	ONGOING
 	FINISHED
 )
+const (
+	TIMEOUT time.Duration = 10 * time.Second
+)
 
+// for logging the stages and task types
 func (t TaskType) String() string {
 	switch t {
 	case 0:
@@ -37,10 +41,11 @@ func (t TaskType) String() string {
 }
 
 type Coordinator struct {
+	currentStage      TaskType
 	mapTaskTracker    TaskTracker
 	reduceTaskTracker TaskTracker
-	currentStage      TaskType
 	workerTracker     WorkerTracker
+	done              bool
 }
 
 type WorkerTracker struct {
@@ -68,21 +73,14 @@ type TaskStatus struct {
 }
 
 type Task struct {
-	Type     TaskType // MAP | REDUCE | EXIT
+	Type         TaskType // MAP | REDUCE | EXIT
 	TaskId       int
 	Filename     string // only used by MAP type
 	NumOfBuckets int    // only used by MAP type for hashing
 	NumOfFiles   int    // only used by REDUCE type for iterating
 }
 
-// Your code here -- RPC handlers for the worker to call.
-
-// an example RPC handler.
-// the RPC argument and reply types are defined in rpc.go.
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
-}
+// RPC handlers for the worker to call.
 
 // register the worker to allocate a worker id and increment the number of worker
 func (c *Coordinator) RegisterWorker(args *RegisterArgs, reply *RegisterReply) error {
@@ -95,7 +93,7 @@ func (c *Coordinator) RegisterWorker(args *RegisterArgs, reply *RegisterReply) e
 	return nil
 }
 func (c *Coordinator) RequestTask(args *RequestArgs, reply *RequestReply) error {
-	// attempt to read from Map Channel
+	// attempt to read from Map Channel, no race condition using channel
 	taskId, ok := <-c.mapTaskTracker.taskToSchedule
 	if ok {
 		mapTask := c.mapTaskTracker.tasks[taskId]
@@ -128,7 +126,7 @@ func (c *Coordinator) TaskFinished(args *FinishedArgs, reply *FinishedReply) err
 	if args.taskType != c.currentStage {
 		log.Fatalf("Mismatch between current stage "+c.currentStage.String()+
 			" and the task type "+args.taskType.String()+" reported by worker %d\n", args.workerId)
-		return os.ErrInvalid
+		return nil
 	}
 	switch args.taskType {
 	case MAP:
@@ -143,13 +141,16 @@ func (c *Coordinator) TaskFinished(args *FinishedArgs, reply *FinishedReply) err
 	case REDUCE:
 		finished := updateTaskStatusPostFinish(&c.reduceTaskTracker, args.taskId, args.workerId)
 		if finished {
+			// Set stage first, close the channel next because longer blocking does no harm
 			c.currentStage = EXIT
 			close(c.reduceTaskTracker.taskToSchedule)
 			log.Println("The REDUCE stage has been completed. Next: EXIT")
+			// flag done to suggest the channels are closed without having to block to query
+			c.done = true
 		}
 	default:
 		log.Fatalf("Bad task type reported being finished: " + args.taskType.String() + "\n")
-		return os.ErrInvalid
+		return nil
 	}
 	return nil
 }
@@ -181,6 +182,23 @@ func updateTaskStatusPostAssignment(taskTracker *TaskTracker, workerId int, task
 	taskStatus.startTime = time.Now()
 	taskStatus.state = ONGOING
 	taskStatus.workerId = workerId
+	go taskTracker.timeoutToReschedule(taskId, TIMEOUT)
+}
+
+// Wait some time and reschedule if not finished or rescheduled
+func (tracker *TaskTracker) timeoutToReschedule(taskId int, timeout time.Duration) {
+	time.Sleep(timeout)
+	defer tracker.mu.Unlock()
+	tracker.mu.Lock()
+	now := time.Now()
+	timeoutTime := tracker.taskStatus[taskId].startTime.Add(timeout)
+	// reschedule only if the state after 10 sec is still ONGOING
+	// neither finished nor already rescheduled
+	// also the last time the task assigned must before the current time minus 10 sec
+	if tracker.taskStatus[taskId].state == ONGOING &&
+		(now.After(timeoutTime) || now.Equal(timeoutTime)) {
+		tracker.taskToSchedule <- taskId
+	}
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -200,21 +218,75 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	return c.done
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
+	// instantiate and initialize the coordinator
+	c := Coordinator{
+		done:         false,
+		currentStage: MAP,
+		mapTaskTracker: TaskTracker{
+			taskType:       MAP,
+			nTask:          len(files),
+			tasks:          make([]Task, len(files)),
+			taskToSchedule: make(chan int),
+			taskStatus:     make([]TaskStatus, len(files)),
+			nFinishedTask:  0,
+		},
+		reduceTaskTracker: TaskTracker{
+			taskType:       REDUCE,
+			nTask:          nReduce,
+			tasks:          make([]Task, nReduce),
+			taskToSchedule: make(chan int),
+			taskStatus:     make([]TaskStatus, nReduce),
+			nFinishedTask:  0,
+		},
+		workerTracker: WorkerTracker{
+			nWorker:       0,
+			exited:        make([]bool, 0),
+			nExitedWorker: 0,
+		},
+	}
+	c.mapTaskTracker.initializeTasksAndStatus(MAP, files, nReduce)
+	c.reduceTaskTracker.initializeTasksAndStatus(REDUCE, files, nReduce)
+	// background threads to supply tasks to the channel
+	go c.mapTaskTracker.supplyTasksToChannel()
+	go c.reduceTaskTracker.supplyTasksToChannel()
 
-	// Your code here.
-
+	// expose the server to the socket, change the states of coordinator and reschedule accordingly
 	c.server()
 	return &c
+}
+
+// initialize the slice fields in taskTracker
+func (tracker *TaskTracker) initializeTasksAndStatus(taskType TaskType, files []string, nReduce int) {
+	for i := 0; i < tracker.nTask; i++ {
+		// initialize task status
+		statusPointer := &tracker.taskStatus[i]
+		statusPointer.state = UNSCHEDULED
+		statusPointer.taskId = i
+		// -1 denotes no worker associated
+		statusPointer.workerId = -1
+
+		// initialize task type
+		taskPointer := &tracker.tasks[i]
+		taskPointer.TaskId = i
+		taskPointer.Type = taskType
+		taskPointer.NumOfBuckets = nReduce
+		taskPointer.NumOfFiles = len(files)
+		if taskType == MAP {
+			taskPointer.Filename = files[i]
+		}
+	}
+}
+
+// supply tasks of a tracker to its channel
+func (tracker *TaskTracker) supplyTasksToChannel() {
+	for i := 0; i < tracker.nTask; i++ {
+		tracker.taskToSchedule <- i
+	}
 }
