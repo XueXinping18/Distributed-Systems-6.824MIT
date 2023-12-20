@@ -2,6 +2,7 @@ package mr
 
 import (
 	"log"
+	"sync/atomic"
 	"time"
 )
 import "net"
@@ -41,11 +42,12 @@ func (t TaskType) String() string {
 }
 
 type Coordinator struct {
-	currentStage      TaskType
+	currentStage      TaskType // Golang does not support volatile or Atomic integer type, so use lock
 	mapTaskTracker    TaskTracker
 	reduceTaskTracker TaskTracker
 	workerTracker     WorkerTracker
-	done              bool
+	done              atomic.Bool
+	mu                sync.Mutex // only for currentStage
 }
 
 type WorkerTracker struct {
@@ -105,7 +107,7 @@ func (c *Coordinator) RequestTask(args *RequestArgs, reply *RequestReply) error 
 		reply.TaskObj = &mapTask
 		// update TaskObj status atomically
 		updateTaskStatusPostAssignment(&c.mapTaskTracker, args.WorkerId, taskId)
-		log.Printf("Map request %d scheduled to worker %d!\n", taskId, args.WorkerId)
+		log.Printf("Map task %d scheduled to worker %d!\n", taskId, args.WorkerId)
 		return nil
 	}
 	// map channel is closed, attempt to read from Reduce channel
@@ -116,7 +118,7 @@ func (c *Coordinator) RequestTask(args *RequestArgs, reply *RequestReply) error 
 		reply.TaskObj = &reduceTask
 		// update TaskObj status atomically
 		updateTaskStatusPostAssignment(&c.reduceTaskTracker, args.WorkerId, taskId)
-		log.Printf("Reduce request %d scheduled to worker %d!\n", taskId, args.WorkerId)
+		log.Printf("Reduce task %d scheduled to worker %d!\n", taskId, args.WorkerId)
 		return nil
 	}
 	// Both channels closed, the job is done, exit
@@ -127,8 +129,11 @@ func (c *Coordinator) RequestTask(args *RequestArgs, reply *RequestReply) error 
 
 // finish a TaskObj, update the status
 func (c *Coordinator) TaskFinished(args *FinishedArgs, reply *FinishedReply) error {
-	if args.Type != c.currentStage {
-		log.Fatalf("Mismatch between current stage "+c.currentStage.String()+
+	c.mu.Lock()
+	currentStage := c.currentStage
+	c.mu.Unlock()
+	if args.Type != currentStage {
+		log.Fatalf("Mismatch between current stage "+currentStage.String()+
 			" and the TaskObj type "+args.Type.String()+" reported by worker %d\n", args.WorkerId)
 		return nil
 	}
@@ -138,7 +143,9 @@ func (c *Coordinator) TaskFinished(args *FinishedArgs, reply *FinishedReply) err
 		if finished {
 			// Set stage first, close the channel next because longer blocking does no harm while start to read
 			// new channel before the stage flags are set might be problematic
+			c.mu.Lock()
 			c.currentStage = REDUCE
+			c.mu.Unlock()
 			close(c.mapTaskTracker.taskToSchedule)
 			log.Println("The MAP stage has been completed. Next: REDUCE")
 		}
@@ -146,11 +153,13 @@ func (c *Coordinator) TaskFinished(args *FinishedArgs, reply *FinishedReply) err
 		finished := updateTaskStatusPostFinish(&c.reduceTaskTracker, args.TaskId, args.WorkerId)
 		if finished {
 			// Set stage first, close the channel next because longer blocking does no harm
+			c.mu.Lock()
 			c.currentStage = EXIT
+			c.mu.Unlock()
 			close(c.reduceTaskTracker.taskToSchedule)
 			log.Println("The REDUCE stage has been completed. Next: EXIT")
 			// flag done to suggest the channels are closed without having to block to query
-			c.done = true
+			c.done.Store(true)
 		}
 	default:
 		log.Fatalf("Bad TaskObj type reported being finished: " + args.Type.String() + "\n")
@@ -223,7 +232,7 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	return c.done
+	return c.done.Load()
 }
 
 // create a Coordinator.
@@ -232,7 +241,6 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// instantiate and initialize the coordinator
 	c := Coordinator{
-		done:         false,
 		currentStage: MAP,
 		mapTaskTracker: TaskTracker{
 			taskType:       MAP,

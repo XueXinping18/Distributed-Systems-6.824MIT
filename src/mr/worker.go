@@ -92,7 +92,7 @@ func handleMapTask(taskId int, filename string, numOfBuckets int, mapf func(stri
 	var tmpFiles []*os.File
 	var encoders []*json.Encoder
 	for i := 0; i < numOfBuckets; i++ {
-		tmpFile, err := ioutil.TempFile("", "temp-"+string(taskId)+"-"+string(i)+"-")
+		tmpFile, err := ioutil.TempFile("", fmt.Sprintf("temp-%d-%d-", taskId, i))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -109,12 +109,12 @@ func handleMapTask(taskId int, filename string, numOfBuckets int, mapf func(stri
 		if err := tmpFile.Close(); err != nil {
 			log.Fatal(err)
 		}
-		os.Rename(tmpFile.Name(), "mr-"+string(taskId)+"-"+string(bucketId))
+		os.Rename(tmpFile.Name(), fmt.Sprintf("mr-%d-%d", taskId, bucketId))
 	}
 }
 func handleReduceTask(taskId int, numOfFiles int, reducef func(string, []string) string) {
 	// create tmp file for write
-	ofile, err := ioutil.TempFile("", "temp-out-"+string(taskId)+"-")
+	ofile, err := ioutil.TempFile("", fmt.Sprintf("temp-out-%d-", taskId))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func handleReduceTask(taskId int, numOfFiles int, reducef func(string, []string)
 	reduceMap := make(map[string][]string)
 	// for each file open the file, decode the file into KeyValue pairs, collect into map
 	for i := 0; i < numOfFiles; i++ {
-		filename := "mr-" + string(i) + "-" + string(taskId)
+		filename := fmt.Sprintf("mr-%d-%d", i, taskId)
 		ifile, err := os.Open(filename)
 		if err != nil {
 			log.Fatal(err)
@@ -151,7 +151,7 @@ func handleReduceTask(taskId int, numOfFiles int, reducef func(string, []string)
 		log.Fatal(err)
 	}
 	// atomic rename
-	newFileName := "mr-out-" + string(taskId)
+	newFileName := fmt.Sprintf("mr-out-%d", taskId)
 	if err := os.Rename(ofile.Name(), newFileName); err != nil {
 		log.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func CallRequestTask(worker *WorkerInfo) (*Task, error) {
 		log.Fatalf("worker %d fail to receive a TaskObj!\n", worker.WorkerId)
 		return nil, errors.New("Failure to communicate!")
 	}
-	fmt.Printf("worker %d received the TaskObj %d with type %d",
+	log.Printf("worker %d received the TaskObj %d with type %d\n",
 		worker.WorkerId, reply.TaskObj.TaskId, reply.TaskObj.Type)
 	return reply.TaskObj, nil
 }
@@ -195,10 +195,10 @@ func CallTaskFinished(worker *WorkerInfo, task *Task) error {
 	reply := FinishedReply{}
 	ok := call("Coordinator.TaskFinished", &args, &reply)
 	if !ok {
-		log.Fatalf("worker %d fail to inform TaskObj %d finished!\n", worker.WorkerId, task.TaskId)
+		log.Fatalf("worker %d fail to inform Task %d finished!\n", worker.WorkerId, task.TaskId)
 		return nil
 	}
-	log.Printf("The finish of TaskObj %d by worker %d has been informed to coordinator\n", task.TaskId, worker.WorkerId)
+	log.Printf("The finish of Task %d has been informed to coordinator\n", task.TaskId)
 	return nil
 }
 
