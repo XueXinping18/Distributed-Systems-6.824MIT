@@ -36,23 +36,29 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	// register the worker
+	log.Println("Worker started!")
 	worker, err := CallRegisterWorker()
 	if err != nil {
 		log.Println("Fail to register worker, assume the coordinator is gone and exit")
 		os.Exit(1)
 	}
+	log.Printf("Worker registered to the coordinator with worder id %d\n", worker.WorkerId)
 	// repeatedly request for TaskObj and inform finished
 	for {
 		task, err := CallRequestTask(worker)
 		if err != nil {
 			log.Println("Fail to request a TaskObj, assume the coordinator is gone and exit")
 			os.Exit(1)
+		} else {
+			log.Printf("Received "+task.Type.String()+" Task %d!\n", task.TaskId)
 		}
 		switch task.Type {
 		case MAP:
 			handleMapTask(task.TaskId, task.Filename, task.NumOfBuckets, mapf)
+			log.Printf(task.Type.String()+" Task %d is finished!\n", task.TaskId)
 		case REDUCE:
 			handleReduceTask(task.TaskId, task.NumOfFiles, reducef)
+			log.Printf(task.Type.String()+" Task %d is finished!\n", task.TaskId)
 		case EXIT:
 			log.Println("Received EXIT signal from coordinator, exit")
 			os.Exit(0)

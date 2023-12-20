@@ -216,6 +216,7 @@ func (c *Coordinator) server() {
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
+	log.Println("A new goroutine is started to listen worker requests!")
 	go http.Serve(l, nil)
 }
 
