@@ -68,10 +68,11 @@ type TaskStatus struct {
 }
 
 type Task struct {
-	Type       TaskType // MAP | REDUCE | EXIT
-	TaskId     int
-	Filename   string // only used by MAP type
-	NumOfFiles int    // only used by REDUCE type
+	Type     TaskType // MAP | REDUCE | EXIT
+	TaskId       int
+	Filename     string // only used by MAP type
+	NumOfBuckets int    // only used by MAP type for hashing
+	NumOfFiles   int    // only used by REDUCE type for iterating
 }
 
 // Your code here -- RPC handlers for the worker to call.
