@@ -25,14 +25,8 @@ type KeyValue struct {
 	Value string
 }
 
-type WorkerInfo struct {
-	WorkerId int
-	mapf     func(string, string) []KeyValue
-	reducef  func(string, []string) string
-}
-
 // use ihash(key) % NReduce to choose the bucket
-// task number for each KeyValue emitted by Map.
+// TaskObj number for each KeyValue emitted by Map.
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
@@ -47,11 +41,11 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		log.Println("Fail to register worker, assume the coordinator is gone and exit")
 		os.Exit(1)
 	}
-	// repeatedly request for task and inform finished
+	// repeatedly request for TaskObj and inform finished
 	for {
 		task, err := CallRequestTask(worker)
 		if err != nil {
-			log.Println("Fail to request a task, assume the coordinator is gone and exit")
+			log.Println("Fail to request a TaskObj, assume the coordinator is gone and exit")
 			os.Exit(1)
 		}
 		switch task.Type {
@@ -67,7 +61,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		}
 		err = CallTaskFinished(worker, task)
 		if err != nil {
-			log.Println("Fail to inform the task finished, assume the coordinator is gone and exit")
+			log.Println("Fail to inform the TaskObj finished, assume the coordinator is gone and exit")
 			os.Exit(1)
 		}
 	}
@@ -157,32 +151,7 @@ func handleReduceTask(taskId int, numOfFiles int, reducef func(string, []string)
 	}
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
-}
+// RPC callers
 
 // register the worker to receive a worker id
 func CallRegisterWorker() (*WorkerInfo, error) {
@@ -191,35 +160,39 @@ func CallRegisterWorker() (*WorkerInfo, error) {
 	ok := call("Coordinator.RegisterWorker", &args, &reply)
 	if ok {
 		worker := new(WorkerInfo)
-		worker.WorkerId = reply.workerId
-		log.Printf("register the worker with id %d\n", reply.workerId)
+		worker.WorkerId = reply.WorkerId
+		log.Printf("register the worker with id %d\n", reply.WorkerId)
 		return worker, nil
 	} else {
 		log.Fatalf("fail to register the worker!\n")
 		return nil, errors.New("Failure to communicate!")
 	}
 }
+
+// request a task from the coordinator
 func CallRequestTask(worker *WorkerInfo) (*Task, error) {
 	args := RequestArgs{worker.WorkerId}
 	reply := RequestReply{}
 	ok := call("Coordinator.RequestTask", &args, &reply)
 	if !ok {
-		log.Fatalf("worker %d fail to receive a task!\n", worker.WorkerId)
+		log.Fatalf("worker %d fail to receive a TaskObj!\n", worker.WorkerId)
 		return nil, errors.New("Failure to communicate!")
 	}
-	fmt.Printf("worker %d received the task %d with type %d",
-		worker.WorkerId, reply.task.TaskId, reply.task.Type)
-	return reply.task, nil
+	fmt.Printf("worker %d received the TaskObj %d with type %d",
+		worker.WorkerId, reply.TaskObj.TaskId, reply.TaskObj.Type)
+	return reply.TaskObj, nil
 }
+
+// inform the coordinator the finish of a task
 func CallTaskFinished(worker *WorkerInfo, task *Task) error {
 	args := FinishedArgs{worker.WorkerId, task.TaskId, task.Type} // type is needed to avoid confusion from network delay
 	reply := FinishedReply{}
 	ok := call("Coordinator.TaskFinished", &args, &reply)
 	if !ok {
-		log.Fatalf("worker %d fail to inform task %d finished!\n", worker.WorkerId, task.TaskId)
+		log.Fatalf("worker %d fail to inform TaskObj %d finished!\n", worker.WorkerId, task.TaskId)
 		return nil
 	}
-	log.Printf("The finish of task %d by worker %d has been informed to coordinator\n", task.TaskId, worker.WorkerId)
+	log.Printf("The finish of TaskObj %d by worker %d has been informed to coordinator\n", task.TaskId, worker.WorkerId)
 	return nil
 }
 

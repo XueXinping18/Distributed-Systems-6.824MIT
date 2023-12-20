@@ -9,37 +9,26 @@ package mr
 import "os"
 import "strconv"
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
 // declare arguments and reply for registering the worker to the coordinator
 type RegisterArgs struct {
 }
 type RegisterReply struct {
-	workerId int
+	WorkerId int
 }
 
-// declare arguments and reply for request a new task
+// declare arguments and reply for request a new TaskObj
 type RequestArgs struct {
-	workerId int
+	WorkerId int
 }
 type RequestReply struct {
-	task *Task
+	TaskObj *Task
 }
+
+// declare arguments and reply format for informing the finish of a TaskObj
 type FinishedArgs struct {
-	workerId int
-	taskId   int
-	taskType TaskType
+	WorkerId int
+	TaskId   int
+	Type     TaskType
 }
 type FinishedReply struct {
 }

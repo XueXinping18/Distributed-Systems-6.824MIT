@@ -27,7 +27,7 @@ const (
 	TIMEOUT time.Duration = 10 * time.Second
 )
 
-// for logging the stages and task types
+// for logging the stages and TaskObj types
 func (t TaskType) String() string {
 	switch t {
 	case 0:
@@ -80,16 +80,20 @@ type Task struct {
 	NumOfFiles   int    // only used by REDUCE type for iterating
 }
 
+type WorkerInfo struct {
+	WorkerId int
+}
+
 // RPC handlers for the worker to call.
 
 // register the worker to allocate a worker id and increment the number of worker
 func (c *Coordinator) RegisterWorker(args *RegisterArgs, reply *RegisterReply) error {
 	defer c.workerTracker.mu.Unlock()
 	c.workerTracker.mu.Lock()
-	reply.workerId = c.workerTracker.nWorker
+	reply.WorkerId = c.workerTracker.nWorker
 	c.workerTracker.nWorker++
 	c.workerTracker.exited = append(c.workerTracker.exited, false)
-	log.Printf("Worker id %d assigned.\n", reply.workerId)
+	log.Printf("Worker id %d assigned.\n", reply.WorkerId)
 	return nil
 }
 func (c *Coordinator) RequestTask(args *RequestArgs, reply *RequestReply) error {
@@ -97,40 +101,40 @@ func (c *Coordinator) RequestTask(args *RequestArgs, reply *RequestReply) error 
 	taskId, ok := <-c.mapTaskTracker.taskToSchedule
 	if ok {
 		mapTask := c.mapTaskTracker.tasks[taskId]
-		// assign the task by reference. Go will send the object instead of pointer in RPC
-		reply.task = &mapTask
-		// update task status atomically
-		updateTaskStatusPostAssignment(&c.mapTaskTracker, args.workerId, taskId)
-		log.Printf("Map request %d scheduled to worker %d!\n", taskId, args.workerId)
+		// assign the TaskObj by reference. Go will send the object instead of pointer in RPC
+		reply.TaskObj = &mapTask
+		// update TaskObj status atomically
+		updateTaskStatusPostAssignment(&c.mapTaskTracker, args.WorkerId, taskId)
+		log.Printf("Map request %d scheduled to worker %d!\n", taskId, args.WorkerId)
 		return nil
 	}
 	// map channel is closed, attempt to read from Reduce channel
 	taskId, ok = <-c.reduceTaskTracker.taskToSchedule
 	if ok {
 		reduceTask := c.reduceTaskTracker.tasks[taskId]
-		// assign the task by reference. Go will send the object instead of pointer in RPC
-		reply.task = &reduceTask
-		// update task status atomically
-		updateTaskStatusPostAssignment(&c.reduceTaskTracker, args.workerId, taskId)
-		log.Printf("Reduce request %d scheduled to worker %d!\n", taskId, args.workerId)
+		// assign the TaskObj by reference. Go will send the object instead of pointer in RPC
+		reply.TaskObj = &reduceTask
+		// update TaskObj status atomically
+		updateTaskStatusPostAssignment(&c.reduceTaskTracker, args.WorkerId, taskId)
+		log.Printf("Reduce request %d scheduled to worker %d!\n", taskId, args.WorkerId)
 		return nil
 	}
 	// Both channels closed, the job is done, exit
-	reply.task = &Task{Type: EXIT}
-	log.Printf("Inform worker %d to exit!\n", args.workerId)
+	reply.TaskObj = &Task{Type: EXIT}
+	log.Printf("Inform worker %d to exit!\n", args.WorkerId)
 	return nil
 }
 
-// finish a task, update the status
+// finish a TaskObj, update the status
 func (c *Coordinator) TaskFinished(args *FinishedArgs, reply *FinishedReply) error {
-	if args.taskType != c.currentStage {
+	if args.Type != c.currentStage {
 		log.Fatalf("Mismatch between current stage "+c.currentStage.String()+
-			" and the task type "+args.taskType.String()+" reported by worker %d\n", args.workerId)
+			" and the TaskObj type "+args.Type.String()+" reported by worker %d\n", args.WorkerId)
 		return nil
 	}
-	switch args.taskType {
+	switch args.Type {
 	case MAP:
-		finished := updateTaskStatusPostFinish(&c.mapTaskTracker, args.taskId, args.workerId)
+		finished := updateTaskStatusPostFinish(&c.mapTaskTracker, args.TaskId, args.WorkerId)
 		if finished {
 			// Set stage first, close the channel next because longer blocking does no harm while start to read
 			// new channel before the stage flags are set might be problematic
@@ -139,7 +143,7 @@ func (c *Coordinator) TaskFinished(args *FinishedArgs, reply *FinishedReply) err
 			log.Println("The MAP stage has been completed. Next: REDUCE")
 		}
 	case REDUCE:
-		finished := updateTaskStatusPostFinish(&c.reduceTaskTracker, args.taskId, args.workerId)
+		finished := updateTaskStatusPostFinish(&c.reduceTaskTracker, args.TaskId, args.WorkerId)
 		if finished {
 			// Set stage first, close the channel next because longer blocking does no harm
 			c.currentStage = EXIT
@@ -149,13 +153,13 @@ func (c *Coordinator) TaskFinished(args *FinishedArgs, reply *FinishedReply) err
 			c.done = true
 		}
 	default:
-		log.Fatalf("Bad task type reported being finished: " + args.taskType.String() + "\n")
+		log.Fatalf("Bad TaskObj type reported being finished: " + args.Type.String() + "\n")
 		return nil
 	}
 	return nil
 }
 
-// update the task status atomically after a task is finished, return true if the stage is also finished
+// update the TaskObj status atomically after a TaskObj is finished, return true if the stage is also finished
 func updateTaskStatusPostFinish(taskTracker *TaskTracker, taskId int, workerId int) bool {
 	defer taskTracker.mu.Unlock()
 	taskTracker.mu.Lock()
@@ -174,7 +178,7 @@ func updateTaskStatusPostFinish(taskTracker *TaskTracker, taskId int, workerId i
 	return false
 }
 
-// atomically update the task status after the task is assigned to a worker
+// atomically update the TaskObj status after the TaskObj is assigned to a worker
 func updateTaskStatusPostAssignment(taskTracker *TaskTracker, workerId int, taskId int) {
 	defer taskTracker.mu.Unlock()
 	taskTracker.mu.Lock()
@@ -194,7 +198,7 @@ func (tracker *TaskTracker) timeoutToReschedule(taskId int, timeout time.Duratio
 	timeoutTime := tracker.taskStatus[taskId].startTime.Add(timeout)
 	// reschedule only if the state after 10 sec is still ONGOING
 	// neither finished nor already rescheduled
-	// also the last time the task assigned must before the current time minus 10 sec
+	// also the last time the TaskObj assigned must before the current time minus 10 sec
 	if tracker.taskStatus[taskId].state == ONGOING &&
 		(now.After(timeoutTime) || now.Equal(timeoutTime)) {
 		tracker.taskToSchedule <- taskId
@@ -256,7 +260,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// background threads to supply tasks to the channel
 	go c.mapTaskTracker.supplyTasksToChannel()
 	go c.reduceTaskTracker.supplyTasksToChannel()
-
+	log.Println("Coordinator is successfully instantiated!")
 	// expose the server to the socket, change the states of coordinator and reschedule accordingly
 	c.server()
 	return &c
@@ -265,14 +269,14 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 // initialize the slice fields in taskTracker
 func (tracker *TaskTracker) initializeTasksAndStatus(taskType TaskType, files []string, nReduce int) {
 	for i := 0; i < tracker.nTask; i++ {
-		// initialize task status
+		// initialize TaskObj status
 		statusPointer := &tracker.taskStatus[i]
 		statusPointer.state = UNSCHEDULED
 		statusPointer.taskId = i
 		// -1 denotes no worker associated
 		statusPointer.workerId = -1
 
-		// initialize task type
+		// initialize TaskObj type
 		taskPointer := &tracker.tasks[i]
 		taskPointer.TaskId = i
 		taskPointer.Type = taskType
