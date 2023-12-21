@@ -89,7 +89,7 @@
 
 - Acts as the persistent storage for the primary and backup (akin to a disk).
 - Decides the next primary in the event of a failure using an atomic test-and-set operation.
-- The connection between the hypervisors and this server is crucial, making it a single point of failure.
+- The connection between the hypervisors and this server is crucial, making it a single point of failure. No replication on arbitrate server.
 
 ### Handling Network Partition vs. Fail-Stop
 
@@ -102,3 +102,8 @@
 - In the event of a "0" response (indicating failed attempt to become new primary), the hypervisor terminates itself for manual repairs. Failed machine also terminates itself.
 - Repair is manual to keep the lagged terminated machine in sync with the running primary. No client service is provided during repairs.
 - After repairs, the backup rejoins the system, and the repair program notifies the arbitrate server to update its status, allowing the appointment of new primary.
+
+### Limitations
+
+- Consist of a single point of failure: the arbitrade server. No replication on that server.
+- Also the virtual machine has a replication, the backup does not server the client requests to increase the read performance. The replication is only for the purpose of fault tolerance without the effect of increasing read throughput.
