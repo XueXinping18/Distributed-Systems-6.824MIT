@@ -107,3 +107,4 @@
 
 - Consist of a single point of failure: the arbitrade server. No replication on that server.
 - The replica of virtual machine, for strong consistency, does not server the client requests at all which might be useful in  increasing the read performance. The replication is only for the purpose of fault tolerance without the effect of increasing read throughput.
+- Potential duplicated reply from both virtual machine to the client. If the primary fails right after it replies to the client and the failover happens, the new primary will still have to send the reply to the client because it does not know whether the old primary has sent it or not. This is not problematic as duplicated replies are normal in the scenario of TCP. Given the identical state between the old primary and new primary, the sequence number of the duplicated replies will be the same. TCP can handle such duplicates.
