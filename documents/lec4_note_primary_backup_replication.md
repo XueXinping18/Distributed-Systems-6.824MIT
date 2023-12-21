@@ -103,7 +103,7 @@
 - Repair is manual to keep the lagged terminated machine in sync with the running primary. No client service is provided during repairs.
 - After repairs, the backup rejoins the system, and the repair program notifies the arbitrate server to update its status, allowing the appointment of new primary.
 
-### Limitations
+### Limitations and Tradeoffs
 
 - Consist of a single point of failure: the arbitrade server. No replication on that server.
-- Also the virtual machine has a replication, the backup does not server the client requests to increase the read performance. The replication is only for the purpose of fault tolerance without the effect of increasing read throughput.
+- The replica of virtual machine, for strong consistency, does not server the client requests at all which might be useful in  increasing the read performance. The replication is only for the purpose of fault tolerance without the effect of increasing read throughput.
