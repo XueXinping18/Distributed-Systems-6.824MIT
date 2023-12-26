@@ -333,14 +333,54 @@ func (rf *Raft) sendAppendEntries(serverId int, args *AppendEntriesArgs, reply *
 func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(serverId, args, reply)
+	// response not received
 	if !ok {
 		return
 	}
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.logConsumer(serverId, "Received reply of AppendEntries")
 	rf.compareTermAndUpdateStates(reply.Term)
-	rf.mu.Unlock()
 	// more operations (2B)
+	// if the AppendEntries are rejected because outdated, don't retry just end
+	if rf.currentTerm > args.Term {
+		rf.logConsumer(serverId, "AppendEntries Rejected because the term of the leader server itself was only %d", args.Term)
+		return
+	}
+
+	if reply.EntriesAccepted {
+		// update nextIndex and matchIndex,
+		// potential out-of-order delivery, must not decrease on successfully received acknowledgement
+		lastIndexAppended := args.Entries[len(args.Entries)-1].Index
+		if lastIndexAppended >= rf.nextIndex[serverId] {
+			rf.nextIndex[serverId] = lastIndexAppended + 1
+		}
+		// matchIndex must not decrease, potential out-of-order delivery
+		if lastIndexAppended >= rf.matchIndex[serverId] {
+			rf.matchIndex[serverId] = lastIndexAppended
+		}
+		committed := rf.tryCommit(lastIndexAppended)
+		if committed {
+			rf.logConsumer(serverId, "Entries up to index %d commited", lastIndexAppended)
+		}
+	} else {
+		// rejected not because term outdated:
+		if rf.nextIndex[serverId] != args.PrevLogIndex+1 {
+			// If entry is rejected but the nextIndex already changed (term is not changed), it means either the two cases happened:
+			// 1. nextIndex has increased, i.e. has acknowledged the replicate of the entry, no need to retry
+			// 2. nextIndex has decreased, i.e. backoff for the entry has happened, no need to retry
+			// in either case: no need to retry
+			return
+		}
+		//doing the retry: note that it must use the term and leaderCommit from previous AppendEntries
+		//because the term might be outdated and only outdated AppendEntries should be sent in such case
+		//e.g. the current leader might impersonate the new leader if new term is used
+		args.PrevLogIndex = rf.getPrevLogIndex(serverId)
+		args.PrevLogTerm = rf.getPrevLogTerm(serverId)
+		args.Entries = append([]LogEntry{rf.log[rf.nextIndex[serverId]]}, args.Entries...)
+		rf.logConsumer(serverId, "AppendEntries Rejected and Retry after decrement the next index into %d", rf.nextIndex[serverId])
+		go rf.sendAndHandleAppendEntries(serverId, args)
+	}
 }
 
 // The ticker go routine starts a new election if this peer:
@@ -358,7 +398,7 @@ func (rf *Raft) ticker() {
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.isLeader() && time.Now().After(rf.nextHeartbeatTime) {
-			rf.broadcastAppendEntries()
+			rf.broadcastAppendEntries(true)
 		} else if !rf.isLeader() && time.Now().After(rf.nextElectionTime) {
 			rf.runForCandidate()
 		}
@@ -368,25 +408,31 @@ func (rf *Raft) ticker() {
 }
 
 // Broadcast AppendEntries Message to all other servers
-func (rf *Raft) broadcastAppendEntries() {
-	// must update the next broadcast time
-	rf.nextHeartbeatTime = time.Now().Add(time.Duration(APPEND_ENTRIES_PERIOD_MILLIS) * time.Millisecond)
+func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
+
+	// must update the next broadcast time if it is heartbeat
+	if isHeartbeat {
+		rf.nextHeartbeatTime = time.Now().Add(time.Duration(APPEND_ENTRIES_PERIOD_MILLIS) * time.Millisecond)
+	}
 
 	rf.logServer("BroadCast AppendEntries Messages...")
 	for i := 0; i < len(rf.peers); i++ {
-		var entries []LogEntry
-		if rf.getLastLogIndex() >= rf.nextIndex[i] {
-			entries = rf.log[rf.nextIndex[i]:]
-		}
-		args := &AppendEntriesArgs{
-			Term:              rf.currentTerm,
-			LeaderId:          rf.me,
-			PrevLogIndex:      rf.getPrevLogIndex(i),
-			PrevLogTerm:       rf.getPrevLogTerm(i),
-			Entries:           entries,
-			LeaderCommitIndex: rf.commitIndex,
-		}
 		if rf.me != i {
+			var entries []LogEntry
+			// to have better performance, we make heartbeat sending log entries
+			if rf.getLastLogIndex() >= rf.nextIndex[i] {
+				entries = rf.log[rf.nextIndex[i]:]
+			}
+			// The assembly of arguments must be in the same thread to make sure there is no
+			// interleaving increase of term. (The leader is the leader of current term not future term)
+			args := &AppendEntriesArgs{
+				Term:              rf.currentTerm,
+				LeaderId:          rf.me,
+				PrevLogIndex:      rf.getPrevLogIndex(i),
+				PrevLogTerm:       rf.getPrevLogTerm(i),
+				Entries:           entries,
+				LeaderCommitIndex: rf.commitIndex,
+			}
 			go rf.sendAndHandleAppendEntries(i, args)
 		}
 	}
@@ -449,7 +495,7 @@ func (rf *Raft) runForCandidate() {
 					rf.initializeLeader()
 
 					// inform other threads of stepping up as leader and send heartbeats
-					rf.broadcastAppendEntries()
+					rf.broadcastAppendEntries(true)
 				}
 				return
 			}
@@ -479,7 +525,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 	index := len(rf.log)
+	// update log and matchIndex of itself
 	rf.log = append(rf.log, LogEntry{Command: command, Index: index, Term: rf.currentTerm})
+	rf.matchIndex[rf.me] = rf.getLastLogIndex()
+	// send appendEntries to all other servers, don't restart heartbeat timer for faster update
+	rf.broadcastAppendEntries(false)
 	return index, rf.currentTerm, true
 }
 
@@ -592,6 +642,32 @@ func (rf *Raft) initializeLeader() {
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
 	}
+	// always match to itself
+	rf.matchIndex[rf.me] = rf.getLastLogIndex()
+}
+
+// On receiving AppendEntries success message, try to see if it is possible to commit the index
+func (rf *Raft) tryCommit(newlyAckedIndex int) bool {
+	// safety requirement: don't commit log of past term until log of current term committed
+	if newlyAckedIndex <= rf.commitIndex || rf.currentTerm != rf.log[newlyAckedIndex].Term {
+		return false
+	}
+	votes := 1
+	for serverId, matched := range rf.matchIndex {
+		// always count itself
+		if serverId == rf.me {
+			continue
+		}
+		if matched >= newlyAckedIndex {
+			votes++
+		}
+	}
+	if votes >= rf.requiredVotesToWin() {
+		// commit if votes enough
+		rf.commitIndex = newlyAckedIndex
+		return true
+	}
+	return false
 }
 
 // judging the rf is more updated than some other rf server given its last Term and last Index
