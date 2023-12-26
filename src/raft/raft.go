@@ -463,13 +463,13 @@ func (rf *Raft) runForCandidate() {
 // Term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if !rf.isLeader() {
+		return -1, -1, false
+	}
+	return len(rf.log), rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -513,7 +513,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		applyChannel:      applyCh,
 		currentTerm:       0,
 		votedFor:          -1,
-		log:               make([]LogEntry, 1),
+		log:               make([]LogEntry, 1), // include a sentinel logEntry
 		commitIndex:       0,
 		lastApplied:       0,
 		identity:          FOLLOWER,
