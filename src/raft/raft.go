@@ -97,6 +97,11 @@ type Raft struct {
 	identity          ServerIdentity
 	nextElectionTime  time.Time // The next time to initiate an election, can be reset (postponed)
 	nextHeartbeatTime time.Time // The next time to broadcast AppendEntries
+
+	// volatile states for leader
+	nextIndex  []int //for each server, index of the next log entry to send to that server
+	matchIndex []int // for each server, index of the highest log entry known to be replicated on server
+
 }
 
 // A single entry in log
@@ -368,15 +373,19 @@ func (rf *Raft) broadcastAppendEntries() {
 	rf.nextHeartbeatTime = time.Now().Add(time.Duration(APPEND_ENTRIES_PERIOD_MILLIS) * time.Millisecond)
 
 	rf.logServer("BroadCast AppendEntries Messages...")
-	args := &AppendEntriesArgs{
-		Term:              rf.currentTerm,
-		LeaderId:          rf.me,
-		PrevLogIndex:      rf.getPrevLogIndex(),
-		PrevLogTerm:       rf.getPrevLogTerm(),
-		Entries:           nil, // to be updated
-		LeaderCommitIndex: rf.commitIndex,
-	}
 	for i := 0; i < len(rf.peers); i++ {
+		var entries []LogEntry
+		if rf.getLastLogIndex() >= rf.nextIndex[i] {
+			entries = rf.log[rf.nextIndex[i]:]
+		}
+		args := &AppendEntriesArgs{
+			Term:              rf.currentTerm,
+			LeaderId:          rf.me,
+			PrevLogIndex:      rf.getPrevLogIndex(i),
+			PrevLogTerm:       rf.getPrevLogTerm(i),
+			Entries:           entries,
+			LeaderCommitIndex: rf.commitIndex,
+		}
 		if rf.me != i {
 			go rf.sendAndHandleAppendEntries(i, args)
 		}
@@ -401,8 +410,8 @@ func (rf *Raft) runForCandidate() {
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: rf.getPrevLogIndex(),
-		LastLogTerm:  rf.getPrevLogTerm(),
+		LastLogIndex: rf.getLastLogIndex(),
+		LastLogTerm:  rf.getLastLogTerm(),
 	}
 	// The potential change to Leader states is designated to the RPC threads handling response from voters
 	// Instead of gathering votes in the current thread, i.e. the thread that gathered the half will declare win
@@ -437,7 +446,7 @@ func (rf *Raft) runForCandidate() {
 				votesGathered++
 				if votesGathered == votesToWin {
 					rf.logConsumer(voterId, "Win the election, step up as leader!")
-					rf.identity = LEADER
+					rf.initializeLeader()
 
 					// inform other threads of stepping up as leader and send heartbeats
 					rf.broadcastAppendEntries()
@@ -469,7 +478,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !rf.isLeader() {
 		return -1, -1, false
 	}
-	return len(rf.log), rf.currentTerm, true
+	index := len(rf.log)
+	rf.log = append(rf.log, LogEntry{Command: command, Index: index, Term: rf.currentTerm})
+	return index, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -519,6 +530,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		identity:          FOLLOWER,
 		nextElectionTime:  time.Now().Add(generateRandomTimeout()), // for the initial election
 		nextHeartbeatTime: time.Now(),                              // not important as not started as a leader
+		nextIndex:         make([]int, len(peers)),                 // only used by leader, reinitialize then
+		matchIndex:        make([]int, len(peers)),                 // only used by leader, reinitialize then
 	}
 	// TODO : reconcile the initialization from nothing (above written by me) and from crash (below given)
 	// initialize from state persisted before a crash
@@ -530,11 +543,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 // Utility functions:
 
-func (rf *Raft) getPrevLogTerm() int {
+// The term of the last log entry
+func (rf *Raft) getLastLogTerm() int {
 	return rf.log[len(rf.log)-1].Term
 }
-func (rf *Raft) getPrevLogIndex() int {
+
+// The index of the last log entry
+func (rf *Raft) getLastLogIndex() int {
 	return len(rf.log) - 1
+}
+
+// The term of the log entry whose existence in a server we are ascertaining
+func (rf *Raft) getPrevLogTerm(serverId int) int {
+	return rf.log[rf.nextIndex[serverId]-1].Term
+}
+
+// The index of the log entry whose existence in a server we are ascertaining
+func (rf *Raft) getPrevLogIndex(serverId int) int {
+	return rf.nextIndex[serverId] - 1
 }
 
 // On receiving RPC requests or responses, update the Term if needed
@@ -555,6 +581,17 @@ func (rf *Raft) compareTermAndUpdateStates(term int) bool {
 // determine if a rf is a leader
 func (rf *Raft) isLeader() bool {
 	return rf.identity == LEADER
+}
+
+// initialize when a server turns into leader
+func (rf *Raft) initializeLeader() {
+	rf.identity = LEADER
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = rf.getLastLogIndex() + 1
+	}
+	for i := range rf.matchIndex {
+		rf.matchIndex[i] = 0
+	}
 }
 
 // judging the rf is more updated than some other rf server given its last Term and last Index
