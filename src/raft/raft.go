@@ -21,9 +21,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"regexp"
-	"runtime"
-	"strconv"
 	"time"
 
 	//	"bytes"
@@ -32,34 +29,6 @@ import (
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
-type Lock struct {
-	mu    sync.Mutex
-	owner int64
-}
-
-func (l *Lock) Lock() {
-	l.mu.Lock()
-	l.owner = getGoroutineID()
-}
-func (l *Lock) Unlock() {
-	l.owner = 0
-	l.mu.Unlock()
-}
-func (l *Lock) Owner() int64 {
-	return l.owner
-}
-func getGoroutineID() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	idField := string(buf[:n])
-	re := regexp.MustCompile(`\d+`)
-	if id := re.FindString(idField); id != "" {
-		idInt, _ := strconv.ParseInt(id, 10, 64)
-		return idInt
-	}
-	return 0
-}
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -100,6 +69,7 @@ const (
 	MIN_ELECTION_TIMEOUT_MILLIS  int64 = 500
 	MAX_ELECTION_TIMEOUT_MILLIS  int64 = 1000
 	APPEND_ENTRIES_PERIOD_MILLIS int64 = 100
+	TICKER_PERIOD_MILLIS         int64 = 30
 )
 const (
 	LEADER ServerIdentity = iota
@@ -109,26 +79,24 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu           Lock                // Lock to protect shared access to this peer's state
-	stepUpCond   *sync.Cond          // Used to synchronize the thread sending heartbeats with the threads that appreciate to leader
-	electionCond *sync.Cond          // Used to synchronize the thread holding an election with the threads that control conditions
-	timedOut     bool                // used by sleeping thread after waking up to make sure there is no reset of timer
-	peers        []*labrpc.ClientEnd // RPC end points of all peers
-	persister    *Persister          // Object to hold this peer's persisted state
-	me           int                 // this peer's Index into peers[]
-	dead         int32               // set by Kill()
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	peers     []*labrpc.ClientEnd // RPC end points of all peers
+	persister *Persister          // Object to hold this peer's persisted state
+	me        int                 // this peer's Index into peers[]
+	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	applyChannel         chan ApplyMsg
-	currentTerm          int
-	votedFor             int // -1 represents not voted yet
-	log                  []LogEntry
-	commitIndex          int // serves as the right boundary of a slicing window
-	lastApplied          int // serves as the left boundary of a slicing window
-	identity             ServerIdentity
-	prevResetTimeoutTime time.Time
+	applyChannel      chan ApplyMsg
+	currentTerm       int
+	votedFor          int // -1 represents not voted yet
+	log               []LogEntry
+	commitIndex       int // serves as the right boundary of a slicing window
+	lastApplied       int // serves as the left boundary of a slicing window
+	identity          ServerIdentity
+	nextElectionTime  time.Time // The next time to initiate an election, can be reset (postponed)
+	nextHeartbeatTime time.Time // The next time to broadcast AppendEntries
 }
 
 // A single entry in log
@@ -138,27 +106,6 @@ type LogEntry struct {
 	Term    int // The Term at which the entry is appended to the log
 }
 
-// The message from leader to other nodes acts as:
-// 1. a heartbeat that reset the election timeout
-// 2. carries the entries to append
-// 3. carries the Index before and through which logs to commit
-type AppendEntriesMsg struct {
-	Term              int
-	LeaderId          int // used for redirection
-	PrevLogIndex      int // used to decide whether previous entries match and to reject entries
-	PrevLogTerm       int // used to decide whether previous entries match and to reject entries
-	Entries           []LogEntry
-	LeaderCommitIndex int // used to inform follower to commit
-}
-
-// The message from candidate to other nodes to request votes
-type RequestVoteMsg struct {
-	Term         int
-	CandidateId  int
-	LastLogIndex int // used for voters to decide whose is more update-to-date and grant vote
-	LastLogTerm  int // used for voters to decide whose is more update-to-date and grant vote
-}
-
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -166,10 +113,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	//rf.mu.Lock()
+	rf.mu.Lock()
 	term = rf.currentTerm
 	isleader = rf.identity == LEADER
-	//rf.mu.Unlock()
+	rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -225,10 +172,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// RequestVote RPC arguments structure.
+// The message from candidate to other nodes to request votes
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	RequestVoteInfo *RequestVoteMsg
+	Term         int
+	CandidateId  int
+	LastLogIndex int // used for voters to decide whose is more update-to-date and grant vote
+	LastLogTerm  int // used for voters to decide whose is more update-to-date and grant vote
 }
 
 // RequestVote RPC reply structure.
@@ -238,9 +187,17 @@ type RequestVoteReply struct {
 	VotedGranted bool
 }
 
-// AppendEntries RPC arguments structure.
+// The message from leader to other nodes acts as:
+// 1. a heartbeat that reset the election timeout
+// 2. carries the entries to append
+// 3. carries the Index before and through which logs to commit
 type AppendEntriesArgs struct {
-	AppendEntriesInfo *AppendEntriesMsg
+	Term              int
+	LeaderId          int // used for redirection
+	PrevLogIndex      int // used to decide whether previous entries match and to reject entries
+	PrevLogTerm       int // used to decide whether previous entries match and to reject entries
+	Entries           []LogEntry
+	LeaderCommitIndex int // used to inform follower to commit
 }
 
 // AppendEntries RPC reply structure.
@@ -252,17 +209,25 @@ type AppendEntriesReply struct {
 // AppendEntriees RPC handler
 func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	rf.logProducer(args.AppendEntriesInfo.LeaderId,
+	rf.logProducer(args.LeaderId,
 		"Received AppendEntries in leader term %d",
-		args.AppendEntriesInfo.Term)
-	rf.compareTermAndUpdate(args.AppendEntriesInfo.Term)
+		args.Term)
+
+	// update the Term and identity if higher term encountered on receiving RPC message
+	rf.compareTermAndUpdateStates(args.Term)
+
+	// reset election timeout if appendEntries are from leader of current term
+	if args.Term == rf.currentTerm {
+		rf.nextElectionTime = time.Now().Add(generateRandomTimeout())
+		if rf.identity == CANDIDATE {
+			// give up the election if someone else declared winning
+			rf.identity = FOLLOWER
+		}
+	}
 	// update reply entries (2B)
 	reply.Term = rf.currentTerm
 	reply.EntriesAccepted = false
-	// reset election timeout if appendEntries are from leader of current term
-	if args.AppendEntriesInfo.Term == rf.currentTerm {
-		rf.prevResetTimeoutTime = time.Now()
-	}
+
 	rf.mu.Unlock()
 	return
 }
@@ -271,35 +236,37 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 func (rf *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	rf.logProducer(args.RequestVoteInfo.CandidateId,
+	rf.logProducer(args.CandidateId,
 		"Received RequestVote in candidate term %d",
-		args.RequestVoteInfo.Term)
+		args.Term)
 
-	// update the Term on receiving RPC message
-	rf.compareTermAndUpdate(args.RequestVoteInfo.Term)
+	// update the Term and identity if higher term encountered on receiving RPC message
+	rf.compareTermAndUpdateStates(args.Term)
 
-	// update reply values
+	// update reply values by not granting by default
 	reply.Term = rf.currentTerm
 	reply.VotedGranted = false
-	// reject if higher Term
-	if args.RequestVoteInfo.Term < rf.currentTerm {
-		return
-	}
+
 	// TODO: potential issue: count of duplicate votes
-	// accept if not voted yet (or duplicate reply received) and
-	if rf.decideGrantVote(args.RequestVoteInfo.CandidateId,
-		args.RequestVoteInfo.LastLogTerm,
-		args.RequestVoteInfo.LastLogIndex) {
-		rf.logProducer(args.RequestVoteInfo.CandidateId, "Server grant vote!")
+	// decide if grant vote
+	if rf.shouldGrantVote(args.CandidateId,
+		args.Term,
+		args.LastLogTerm,
+		args.LastLogIndex) {
+		rf.logProducer(args.CandidateId, "Server grant vote!")
+		// grant the vote
 		reply.VotedGranted = true
-		rf.votedFor = args.RequestVoteInfo.CandidateId
-		rf.prevResetTimeoutTime = time.Now()
+		rf.votedFor = args.CandidateId
+
+		// postpone the election (reset the timeout)
+		rf.nextElectionTime = time.Now().Add(generateRandomTimeout())
 	}
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) decideGrantVote(candidateId int, candidateLastLogTerm int, candidateLastLogIndex int) bool {
-	return (rf.votedFor == -1 || rf.votedFor == candidateId) &&
+func (rf *Raft) shouldGrantVote(candidateId int, candidateTerm int,
+	candidateLastLogTerm int, candidateLastLogIndex int) bool {
+	return candidateTerm >= rf.currentTerm && (rf.votedFor == -1 || rf.votedFor == candidateId) &&
 		!rf.isMoreUpdated(candidateLastLogTerm, candidateLastLogIndex)
 }
 
@@ -366,7 +333,7 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 	}
 	rf.mu.Lock()
 	rf.logConsumer(serverId, "Received reply of AppendEntries")
-	rf.compareTermAndUpdate(reply.Term)
+	rf.compareTermAndUpdateStates(reply.Term)
 	rf.mu.Unlock()
 	// more operations (2B)
 }
@@ -376,120 +343,69 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 //  2. has timedOut for a randomized period of time without receiving any of the following:
 //     1> received AppendEntries from the current leader
 //     2> granted vote
-func (rf *Raft) electionTicker() {
+//     3> just started an election
+//
+// The ticker also responsible to periodically broadcast heartbeats if it is a leader
+func (rf *Raft) ticker() {
 	rf.mu.Lock()
-	rf.logServer("Election Ticker Started")
+	rf.logServer("Ticker Started")
 	rf.mu.Unlock()
 	for !rf.killed() {
-		rf.logServer("A new round of election ticking as a " + rf.identity.String())
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-		rf.logServer("BLOCK: Waiting for lock, owner ID: %d", rf.mu.Owner())
 		rf.mu.Lock()
-		rf.logServer("UNBLOCK: Lock Acquired")
-		// We will not set up a timeout time for a leader
-		for !(!rf.isLeader() && rf.timedOut) {
-			rf.logServer("BLOCK: Election timer put to sleep: %d", rf.mu.Owner())
-			rf.electionCond.Wait()
-			rf.logServer("UNBLOCK: Wake up from the waiting for step down as leader")
+		if rf.isLeader() && time.Now().After(rf.nextHeartbeatTime) {
+			rf.broadcastAppendEntries()
+		} else if !rf.isLeader() && time.Now().After(rf.nextElectionTime) {
+			rf.runForCandidate()
 		}
-		// No reset happened to prevent an election: just set current as reset time and reset timedOut as false
-		rf.prevResetTimeoutTime = time.Now()
-		rf.timedOut = false
-		go rf.electionTimeout()
-		// Create threads each handling a RequestVote RPC
-		rf.runForCandidate()
 		rf.mu.Unlock()
-	}
-	rf.mu.Lock()
-	rf.logServer("Election ticker is Terminated!")
-	rf.mu.Unlock()
-}
-
-// This thread sleep for a random time and wake up to check if there is an interleaving reset happened
-// If such reset happened, the thread does nothing. Otherwise, set the variable rf.timedOut to be true
-// and notify the election-ticker thread
-func (rf *Raft) electionTimeout() {
-	// randomize election timeout time
-	var timeout time.Duration
-	timeout = time.Duration(rand.Int63n(MAX_ELECTION_TIMEOUT_MILLIS-MIN_ELECTION_TIMEOUT_MILLIS)+
-		MIN_ELECTION_TIMEOUT_MILLIS) * time.Millisecond
-	// timer start
-	rf.mu.Lock()
-	rf.logServer("An timeout timer started for " + timeout.String())
-	rf.mu.Unlock()
-	time.Sleep(timeout)
-
-	// wake up and check if timeout
-	defer rf.mu.Unlock()
-	rf.mu.Lock()
-	electionTime := rf.prevResetTimeoutTime.Add(timeout)
-	now := time.Now()
-	if now.After(electionTime) || now.Equal(electionTime) {
-		// Within the same lock creating threads each to request a vote and update the candidate accordingly
-		rf.logServer("Election triggered after a timeout for" + timeout.String())
-		// new election will trigger a reset
-		rf.timedOut = true
-		rf.electionCond.Broadcast()
+		time.Sleep(time.Duration(TICKER_PERIOD_MILLIS) * time.Millisecond)
 	}
 }
 
-// The leaderTicker go routine periodically sends to other servers the appendEntries request
-func (rf *Raft) leaderTicker() {
-	rf.mu.Lock()
-	rf.logServer("Leader Ticker started!")
-	rf.mu.Unlock()
+// Broadcast AppendEntries Message to all other servers
+func (rf *Raft) broadcastAppendEntries() {
+	// must update the next broadcast time
+	rf.nextHeartbeatTime = time.Now().Add(time.Duration(APPEND_ENTRIES_PERIOD_MILLIS) * time.Millisecond)
 
-	for !rf.killed() {
-		rf.logServer("A new round of leader ticking")
-		rf.mu.Lock()
-		for !rf.isLeader() {
-			rf.stepUpCond.Wait()
-		}
-
-		message := &AppendEntriesMsg{
-			Term:              rf.currentTerm,
-			LeaderId:          rf.me,
-			PrevLogIndex:      rf.getPrevLogIndex(),
-			PrevLogTerm:       rf.getPrevLogTerm(),
-			Entries:           nil, // to be updated
-			LeaderCommitIndex: rf.commitIndex,
-		}
-		rf.mu.Unlock()
-		args := &AppendEntriesArgs{message}
-		for i := 0; i < len(rf.peers); i++ {
-			if rf.me != i {
-				go rf.sendAndHandleAppendEntries(i, args)
-			}
-		}
-		period := time.Duration(APPEND_ENTRIES_PERIOD_MILLIS) * time.Millisecond
-		time.Sleep(period)
+	rf.logServer("BroadCast AppendEntries Messages...")
+	args := &AppendEntriesArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		PrevLogIndex:      rf.getPrevLogIndex(),
+		PrevLogTerm:       rf.getPrevLogTerm(),
+		Entries:           nil, // to be updated
+		LeaderCommitIndex: rf.commitIndex,
 	}
-	rf.mu.Lock()
-	rf.logServer("Leader Ticker is Terminated")
-	rf.mu.Unlock()
+	for i := 0; i < len(rf.peers); i++ {
+		if rf.me != i {
+			go rf.sendAndHandleAppendEntries(i, args)
+		}
+	}
 }
 
 func (rf *Raft) runForCandidate() {
-	// change states to itself and vote for itself
+	// reset the timer for next election
+	rf.nextElectionTime = time.Now().Add(generateRandomTimeout())
+
+	// change states and vote for itself
+	rf.logServer("Server declared as a CANDIDATE")
 	rf.identity = CANDIDATE
 	rf.currentTerm += 1
-	rf.logServer("Server declared as a CANDIDATE")
 	rf.votedFor = rf.me
-	// define requestVote message
-	requestVoteMsg := &RequestVoteMsg{
+	// define shared states for threads responsible for sending RequestVote and gathering vote
+	// These variables can be loaded and modified in each thread using Closure
+	// alternative approaches to closure is passing pointer of struct
+	votesToWin := rf.requiredVotesToWin()
+	votesGathered := 1
+	// shared RPC arguments
+	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: rf.getPrevLogIndex(),
 		LastLogTerm:  rf.getPrevLogTerm(),
 	}
-	votesToWin := rf.requiredVotesToWin()
-	votesGathered := 1
-	// shared arguments
-	args := &RequestVoteArgs{requestVoteMsg}
 	// The potential change to Leader states is designated to the RPC threads handling response from voters
-	// Instead of gathering votes in the current thread
+	// Instead of gathering votes in the current thread, i.e. the thread that gathered the half will declare win
 	for voterId := range rf.peers {
 		if voterId == rf.me {
 			continue
@@ -507,12 +423,12 @@ func (rf *Raft) runForCandidate() {
 				return
 			}
 			// message received: update term and possibly step down
-			rf.compareTermAndUpdate(reply.Term)
+			rf.compareTermAndUpdateStates(reply.Term)
 
 			// Scenario 2: election is outdated, including two cases
 			// case 1: by the time the RPC received the message, election already timeout
 			// case 2: received message has term larger than the request
-			if rf.currentTerm > args.RequestVoteInfo.Term {
+			if rf.currentTerm > args.Term {
 				return
 			}
 			// Scenario 3: received votes
@@ -522,8 +438,9 @@ func (rf *Raft) runForCandidate() {
 				if votesGathered == votesToWin {
 					rf.logConsumer(voterId, "Win the election, step up as leader!")
 					rf.identity = LEADER
+
 					// inform other threads of stepping up as leader and send heartbeats
-					rf.stepUpCond.Broadcast()
+					rf.broadcastAppendEntries()
 				}
 				return
 			}
@@ -568,7 +485,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 	rf.mu.Lock()
-	rf.logServer("Kill the server")
+	rf.logServer("The Server is just Killed!")
 	rf.mu.Unlock()
 }
 
@@ -588,31 +505,26 @@ func (rf *Raft) killed() bool {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-	// Your initialization code here (2A, 2B, 2C).
-	rf.dead = 0
-	rf.applyChannel = applyCh
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	rf.log = make([]LogEntry, 1) // Add the placeholder sentinel entry
-	rf.commitIndex = 0
-	rf.lastApplied = 0
-	rf.identity = FOLLOWER
-	rf.stepUpCond = sync.NewCond(&rf.mu.mu)
-	rf.electionCond = sync.NewCond(&rf.mu.mu)
+	rf := &Raft{
+		peers:             peers,
+		persister:         persister,
+		me:                me,
+		dead:              0,
+		applyChannel:      applyCh,
+		currentTerm:       0,
+		votedFor:          -1,
+		log:               make([]LogEntry, 1),
+		commitIndex:       0,
+		lastApplied:       0,
+		identity:          FOLLOWER,
+		nextElectionTime:  time.Now().Add(generateRandomTimeout()), // for the initial election
+		nextHeartbeatTime: time.Now(),                              // not important as not started as a leader
+	}
 	// TODO : reconcile the initialization from nothing (above written by me) and from crash (below given)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
-	rf.timedOut = true
-	rf.prevResetTimeoutTime = time.Now()
-	go rf.electionTicker()
-	go rf.leaderTicker()
-
+	go rf.ticker()
 	return rf
 }
 
@@ -626,13 +538,12 @@ func (rf *Raft) getPrevLogIndex() int {
 }
 
 // On receiving RPC requests or responses, update the Term if needed
-func (rf *Raft) compareTermAndUpdate(term int) bool {
+func (rf *Raft) compareTermAndUpdateStates(term int) bool {
 	if term > rf.currentTerm {
 		rf.logServer("Higher term encountered!")
 		rf.currentTerm = term
 		if rf.isLeader() {
 			rf.logServer("Step down from leader!")
-			rf.electionCond.Broadcast()
 		}
 		rf.identity = FOLLOWER
 		rf.votedFor = -1 // not voted in the Term
@@ -676,4 +587,8 @@ func (rf *Raft) logConsumer(producerId int, format string, args ...interface{}) 
 	prefix := fmt.Sprintf("TERM-%d %d->%d: ", rf.currentTerm, rf.me, producerId)
 	message := prefix + format + "\n"
 	log.Printf(message, args...)
+}
+func generateRandomTimeout() time.Duration {
+	return time.Duration(rand.Int63n(MAX_ELECTION_TIMEOUT_MILLIS-MIN_ELECTION_TIMEOUT_MILLIS)+
+		MIN_ELECTION_TIMEOUT_MILLIS) * time.Millisecond
 }
