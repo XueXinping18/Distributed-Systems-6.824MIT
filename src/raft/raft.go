@@ -366,25 +366,30 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 		rf.logConsumer(serverId, "AppendEntries RPC encountered issue")
 		return
 	}
-	rf.logConsumer(serverId, "Received reply of AppendEntries")
+
 	rf.compareTermAndUpdateStates(reply.Term)
 	// more operations (2B)
 	// if the AppendEntries are rejected because outdated, don't retry just end
 	if rf.currentTerm > args.Term {
-		rf.logConsumer(serverId, "AppendEntries Rejected because the term of the leader server itself was only %d", args.Term)
+		rf.logConsumer(serverId, "AppendEntries Rejected because of smaller term %d", args.Term)
 		return
 	}
 
 	if reply.EntriesAccepted {
+		rf.logConsumer(serverId, "Leader notified that AppendEntries accepted by a follower!")
 		// update nextIndex and matchIndex,
 		// potential out-of-order delivery, must not decrease on successfully received acknowledgement
 		lastIndexAppended := args.PrevLogIndex + len(args.Entries)
 		if lastIndexAppended >= rf.nextIndex[serverId] {
+			prev := rf.nextIndex[serverId]
 			rf.nextIndex[serverId] = lastIndexAppended + 1
+			rf.logConsumer(serverId, "nextIndex for the follower increased from %d to %d", prev, rf.nextIndex[serverId])
 		}
 		// matchIndex must not decrease, potential out-of-order delivery
 		if lastIndexAppended >= rf.matchIndex[serverId] {
+			prev := rf.matchIndex[serverId]
 			rf.matchIndex[serverId] = lastIndexAppended
+			rf.logConsumer(serverId, "matchIndex for the follower increased from %d to %d", prev, rf.matchIndex[serverId])
 		}
 		firstIndexAppended := args.PrevLogIndex + 1
 		// Try to commit the entry if majority agreement holds
@@ -408,6 +413,7 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 			// 1. nextIndex has increased, i.e. has acknowledged the replicate of the entry, no need to retry
 			// 2. nextIndex has decreased, i.e. backoff for the entry has happened, no need to retry again
 			// in either case: no need to retry
+			rf.logConsumer(serverId, "AppendEntries Rejected but no need to retry as leader nextIndex has changed")
 			return
 		}
 		rf.nextIndex[serverId]--
