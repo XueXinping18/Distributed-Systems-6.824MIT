@@ -95,9 +95,9 @@ type Raft struct {
 	commitIndex       int // serves as the right boundary of a slicing window
 	lastApplied       int // serves as the left boundary of a slicing window
 	identity          ServerIdentity
-	nextElectionTime  time.Time // The next time to initiate an election, can be reset (postponed)
-	nextHeartbeatTime time.Time // The next time to broadcast AppendEntries
-
+	nextElectionTime  time.Time  // The next time to initiate an election, can be reset (postponed)
+	nextHeartbeatTime time.Time  // The next time to broadcast AppendEntries
+	commitCond        *sync.Cond // conditional variable listening to the commit of entry to happen
 	// volatile states for leader
 	nextIndex  []int //for each server, index of the next log entry to send to that server
 	matchIndex []int // for each server, index of the highest log entry known to be replicated on server
@@ -214,6 +214,7 @@ type AppendEntriesReply struct {
 // AppendEntriees RPC handler
 func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.logProducer(args.LeaderId,
 		"Received AppendEntries in leader term %d",
 		args.Term)
@@ -227,13 +228,43 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		if rf.identity == CANDIDATE {
 			// give up the election if someone else declared winning
 			rf.identity = FOLLOWER
+			rf.logProducer(args.LeaderId, "Give up election because the winner sent AppendEntries!")
 		}
 	}
 	// update reply entries (2B)
 	reply.Term = rf.currentTerm
-	reply.EntriesAccepted = false
-
-	rf.mu.Unlock()
+	// outdated AppendEntries
+	if args.Term < rf.currentTerm {
+		reply.EntriesAccepted = false
+		rf.logProducer(args.LeaderId, "Reject AppendEntries because the leader is outdated with term %d", args.Term)
+		return
+	}
+	// does not match the logEntry
+	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.EntriesAccepted = false
+		rf.logProducer(args.LeaderId, "Reject AppendEntries because previous log does not match with index %d!", args.PrevLogIndex)
+		return
+	}
+	// matched all previous entries, start to update log afterwards
+	startIndex := args.PrevLogIndex + 1
+	for i, entry := range args.Entries {
+		if startIndex+i >= len(rf.log) {
+			rf.log = append(rf.log, entry)
+		} else if rf.log[startIndex+i].Term != entry.Term {
+			// by log matching rule, examining term and index is sufficient
+			rf.log = append(rf.log[:startIndex+i], entry)
+		}
+	}
+	rf.logProducer(args.LeaderId, "Accept AppendEntries!")
+	// Find the last index in the newly appended entries, avoid out-of-bound error
+	lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
+	if args.LeaderCommitIndex > rf.commitIndex {
+		prev := rf.commitIndex // for logging purpose
+		rf.commitIndex = min(args.LeaderCommitIndex, lastNewEntryIndex)
+		rf.commitCond.Broadcast()
+		rf.logProducer(args.LeaderId, "Accept of AppendEntries increases the commitIndex from %d to %d", prev, rf.commitIndex)
+	}
+	reply.EntriesAccepted = true
 	return
 }
 
@@ -351,7 +382,7 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 	if reply.EntriesAccepted {
 		// update nextIndex and matchIndex,
 		// potential out-of-order delivery, must not decrease on successfully received acknowledgement
-		lastIndexAppended := args.Entries[len(args.Entries)-1].Index
+		lastIndexAppended := args.PrevLogIndex + len(args.Entries)
 		if lastIndexAppended >= rf.nextIndex[serverId] {
 			rf.nextIndex[serverId] = lastIndexAppended + 1
 		}
@@ -359,19 +390,31 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 		if lastIndexAppended >= rf.matchIndex[serverId] {
 			rf.matchIndex[serverId] = lastIndexAppended
 		}
-		committed := rf.tryCommit(lastIndexAppended)
-		if committed {
-			rf.logConsumer(serverId, "Entries up to index %d commited", lastIndexAppended)
+		firstIndexAppended := args.PrevLogIndex + 1
+		// Try to commit the entry if majority agreement holds
+		// iterate from highest to lowest among newly appended entries
+		// Only need to examine newly appended entries because:
+		// 1. Entry from the previous term cannot trigger a commit.
+		// 2. An opportunity to commit an entry from the current term will never be missed
+		// because the entry will be resent to each server until acknowledged
+		// (i.e. nextIndex won't increase until accepted and try-committed)
+		for i := lastIndexAppended; i >= max(firstIndexAppended, rf.commitIndex+1); i-- {
+			committed := rf.tryCommit(lastIndexAppended)
+			if committed {
+				rf.logConsumer(serverId, "Entries up to index %d committed", lastIndexAppended)
+				break
+			}
 		}
 	} else {
-		// rejected not because term outdated:
+		// rejected not because of term outdated
 		if rf.nextIndex[serverId] != args.PrevLogIndex+1 {
 			// If entry is rejected but the nextIndex already changed (term is not changed), it means either the two cases happened:
 			// 1. nextIndex has increased, i.e. has acknowledged the replicate of the entry, no need to retry
-			// 2. nextIndex has decreased, i.e. backoff for the entry has happened, no need to retry
+			// 2. nextIndex has decreased, i.e. backoff for the entry has happened, no need to retry again
 			// in either case: no need to retry
 			return
 		}
+		rf.nextIndex[serverId]--
 		//doing the retry: note that it must use the term and leaderCommit from previous AppendEntries
 		//because the term might be outdated and only outdated AppendEntries should be sent in such case
 		//e.g. the current leader might impersonate the new leader if new term is used
@@ -404,6 +447,47 @@ func (rf *Raft) ticker() {
 		}
 		rf.mu.Unlock()
 		time.Sleep(time.Duration(TICKER_PERIOD_MILLIS) * time.Millisecond)
+	}
+}
+
+// Observe events involving commits, increment lastApplied and apply to the state machine
+func (rf *Raft) commitObserver() {
+	// Because the loop is not entirely locked, some notification might be missed while not waiting
+	// Last resort is to periodically notify the observer to check if apply is available
+	go func() {
+		for !rf.killed() {
+			time.Sleep(time.Duration(TICKER_PERIOD_MILLIS) * time.Millisecond)
+			// wrapped in lock to reduce the number of missed notifications
+			rf.mu.Lock()
+			rf.commitCond.Broadcast()
+			rf.mu.Unlock()
+		}
+	}()
+	applyQueue := make([]ApplyMsg, 0)
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.commitIndex <= rf.lastApplied {
+			// check invariant for debugging
+			if rf.commitIndex < rf.lastApplied {
+				rf.logServer("ERROR: Invariant is not maintained! commitIndex smaller than lastApplied")
+			}
+			rf.commitCond.Wait()
+		}
+		for i := rf.lastApplied; i < rf.commitIndex; i++ {
+			applyQueue = append(applyQueue, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			})
+			rf.lastApplied++
+		}
+		rf.mu.Unlock()
+		// to avoid blocking while holding lock, apply outside the lock
+		for _, msg := range applyQueue {
+			rf.applyChannel <- msg
+		}
+		// Reset the slice length to zero
+		applyQueue = applyQueue[:0]
 	}
 }
 
@@ -583,6 +667,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		nextIndex:         make([]int, len(peers)),                 // only used by leader, reinitialize then
 		matchIndex:        make([]int, len(peers)),                 // only used by leader, reinitialize then
 	}
+	// associate conditional variables
+	rf.commitCond = sync.NewCond(&rf.mu)
 	// TODO : reconcile the initialization from nothing (above written by me) and from crash (below given)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -648,6 +734,10 @@ func (rf *Raft) initializeLeader() {
 
 // On receiving AppendEntries success message, try to see if it is possible to commit the index
 func (rf *Raft) tryCommit(newlyAckedIndex int) bool {
+	if newlyAckedIndex >= len(rf.log) {
+		log.Fatalf("Server-%d: Unexpected: try to commit with index higher than the highest entry in log!", rf.me)
+		return false
+	}
 	// safety requirement: don't commit log of past term until log of current term committed
 	if newlyAckedIndex <= rf.commitIndex || rf.currentTerm != rf.log[newlyAckedIndex].Term {
 		return false
@@ -665,6 +755,7 @@ func (rf *Raft) tryCommit(newlyAckedIndex int) bool {
 	if votes >= rf.requiredVotesToWin() {
 		// commit if votes enough
 		rf.commitIndex = newlyAckedIndex
+		rf.commitCond.Broadcast()
 		return true
 	}
 	return false
@@ -704,4 +795,16 @@ func (rf *Raft) logConsumer(producerId int, format string, args ...interface{}) 
 func generateRandomTimeout() time.Duration {
 	return time.Duration(rand.Int63n(MAX_ELECTION_TIMEOUT_MILLIS-MIN_ELECTION_TIMEOUT_MILLIS)+
 		MIN_ELECTION_TIMEOUT_MILLIS) * time.Millisecond
+}
+func max(x int, y int) int {
+	if x > y {
+		return x
+	}
+	return y
+}
+func min(x int, y int) int {
+	if x < y {
+		return x
+	}
+	return y
 }
