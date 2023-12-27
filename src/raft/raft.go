@@ -386,7 +386,7 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 			rf.logConsumer(serverId, "nextIndex for the follower increased from %d to %d", prev, rf.nextIndex[serverId])
 		}
 		// matchIndex must not decrease, potential out-of-order delivery
-		if lastIndexAppended >= rf.matchIndex[serverId] {
+		if lastIndexAppended > rf.matchIndex[serverId] {
 			prev := rf.matchIndex[serverId]
 			rf.matchIndex[serverId] = lastIndexAppended
 			rf.logConsumer(serverId, "matchIndex for the follower increased from %d to %d", prev, rf.matchIndex[serverId])
@@ -477,7 +477,7 @@ func (rf *Raft) commitObserver() {
 			}
 			rf.commitCond.Wait()
 		}
-		for i := rf.lastApplied; i < rf.commitIndex; i++ {
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			applyQueue = append(applyQueue, ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[i].Command,
