@@ -352,11 +352,6 @@ func (rf *Raft) sendAppendEntries(serverId int, args *AppendEntriesArgs, reply *
 	rf.logConsumer(serverId, "Send AppendEntries to a server")
 	rf.mu.Unlock()
 	ok := rf.peers[serverId].Call("Raft.HandleAppendEntries", args, reply)
-	if !ok {
-		rf.mu.Lock()
-		rf.logConsumer(serverId, "AppendEntries RPC encountered issue")
-		rf.mu.Unlock()
-	}
 	return ok
 }
 
@@ -364,12 +359,13 @@ func (rf *Raft) sendAppendEntries(serverId int, args *AppendEntriesArgs, reply *
 func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(serverId, args, reply)
-	// response not received
-	if !ok {
-		return
-	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// response not received
+	if !ok {
+		rf.logConsumer(serverId, "AppendEntries RPC encountered issue")
+		return
+	}
 	rf.logConsumer(serverId, "Received reply of AppendEntries")
 	rf.compareTermAndUpdateStates(reply.Term)
 	// more operations (2B)
@@ -455,6 +451,7 @@ func (rf *Raft) commitObserver() {
 	// Because the loop is not entirely locked, some notification might be missed while not waiting
 	// Last resort is to periodically notify the observer to check if apply is available
 	go func() {
+		rf.logServer("The timer to send notifications for applying command started!")
 		for !rf.killed() {
 			time.Sleep(time.Duration(TICKER_PERIOD_MILLIS) * time.Millisecond)
 			// wrapped in lock to reduce the number of missed notifications
@@ -463,6 +460,7 @@ func (rf *Raft) commitObserver() {
 			rf.mu.Unlock()
 		}
 	}()
+	rf.logServer("The commit observer started!")
 	applyQueue := make([]ApplyMsg, 0)
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -485,6 +483,7 @@ func (rf *Raft) commitObserver() {
 		// to avoid blocking while holding lock, apply outside the lock
 		for _, msg := range applyQueue {
 			rf.applyChannel <- msg
+			rf.logServer("The log entries up to index %d has been applied!", msg.CommandIndex)
 		}
 		// Reset the slice length to zero
 		applyQueue = applyQueue[:0]
@@ -674,6 +673,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.ticker()
+	go rf.commitObserver()
+
 	return rf
 }
 
@@ -735,7 +736,7 @@ func (rf *Raft) initializeLeader() {
 // On receiving AppendEntries success message, try to see if it is possible to commit the index
 func (rf *Raft) tryCommit(newlyAckedIndex int) bool {
 	if newlyAckedIndex >= len(rf.log) {
-		log.Fatalf("Server-%d: Unexpected: try to commit with index higher than the highest entry in log!", rf.me)
+		log.Fatalf("Server-%d: ERROR: try to commit with index higher than the highest entry in log!", rf.me)
 		return false
 	}
 	// safety requirement: don't commit log of past term until log of current term committed
@@ -755,6 +756,7 @@ func (rf *Raft) tryCommit(newlyAckedIndex int) bool {
 	if votes >= rf.requiredVotesToWin() {
 		// commit if votes enough
 		rf.commitIndex = newlyAckedIndex
+		rf.logServer("Entries up to index %d committed", newlyAckedIndex)
 		rf.commitCond.Broadcast()
 		return true
 	}
