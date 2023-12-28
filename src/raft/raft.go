@@ -155,7 +155,11 @@ func (rf *Raft) persist() {
 	}
 
 	data := writeBuffer.Bytes()
-	rf.persister.SaveRaftState(data)
+	// according to protocol, empty snapshot should be saved as nil
+	if len(rf.snapshot) == 0 {
+		rf.snapshot = nil
+	}
+	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
 }
 
 // restore previously persisted state.
