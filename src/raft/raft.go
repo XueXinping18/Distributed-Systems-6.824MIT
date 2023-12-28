@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -89,7 +91,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	applyChannel      chan ApplyMsg
-	currentTerm       int
+	currentTerm       int // The term it is in
 	votedFor          int // -1 represents not voted yet
 	log               []LogEntry
 	commitIndex       int // serves as the right boundary of a slicing window
@@ -130,13 +132,20 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	rf.logServer("Save the server states to stable storage!")
+	writeBuffer := new(bytes.Buffer)
+	e := labgob.NewEncoder(writeBuffer)
+	if e.Encode(rf.currentTerm) != nil {
+		rf.logServer("Failed to encode current term!")
+	}
+	if e.Encode(rf.votedFor) != nil {
+		rf.logServer("Failed to encode who the server voted for!")
+	}
+	if e.Encode(rf.log) != nil {
+		rf.logServer("Failed to encode log!")
+	}
+	data := writeBuffer.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -144,19 +153,26 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	rf.logServer("Read from stable storage states of the server!")
+	readBuffer := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(readBuffer)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil {
+		rf.logServer("Failed to read current term from persistent state!")
+	}
+	if d.Decode(&votedFor) != nil {
+		rf.logServer("Failed to read who the server voted for from persistent state")
+	}
+	if d.Decode(&log) != nil {
+		rf.logServer("Failed to read log from persistent state")
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = log
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -209,6 +225,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term            int
 	EntriesAccepted bool
+	//  if the entries are not accepted,
+	//  return the first index of that conflicted term or the first entry it misses if too short
+	//  instruction about the index that the Leader should send entries from to accelerate success
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // AppendEntriees RPC handler
@@ -222,7 +243,7 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	// update the Term and identity if higher term encountered on receiving RPC message
 	rf.compareTermAndUpdateStates(args.Term)
 
-	// reset election timeout if appendEntries are from leader of current term
+	// reset election timeout if AppendEntries are from leader of current term
 	if args.Term == rf.currentTerm {
 		rf.nextElectionTime = time.Now().Add(generateRandomTimeout())
 		if rf.identity == CANDIDATE {
@@ -242,20 +263,38 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	// does not match the logEntry
 	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.EntriesAccepted = false
+		// case 1: mismatch because no such entry at PrevLogIndex
+		if len(rf.log) <= args.PrevLogIndex {
+			reply.ConflictIndex = len(rf.log)
+			reply.ConflictTerm = -1 // a different term will lead to resend from this index
+		} else {
+			// case 2: mismatch because conflicted term at PrevLogIndex
+			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			for i := args.PrevLogIndex; i >= 0 && rf.log[i].Term == reply.ConflictTerm; i-- {
+				reply.ConflictIndex = i
+			}
+		}
 		rf.logProducer(args.LeaderId, "Reject AppendEntries because previous log does not match with index %d!", args.PrevLogIndex)
 		return
 	}
 	// matched all previous entries, start to update log afterwards
 	startIndex := args.PrevLogIndex + 1
+	logModified := false // the log is modified iff either happened
 	for i, entry := range args.Entries {
 		if startIndex+i >= len(rf.log) {
 			rf.log = append(rf.log, entry)
+			logModified = true
 		} else if rf.log[startIndex+i].Term != entry.Term {
 			// by log matching rule, examining term and index is sufficient
 			rf.log = append(rf.log[:startIndex+i], entry)
+			logModified = true
 		}
 	}
 	rf.logProducer(args.LeaderId, "Accept AppendEntries!")
+	// persist if log modified
+	if logModified {
+		rf.persist()
+	}
 	// Find the last index in the newly appended entries, avoid out-of-bound error
 	lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
 	if args.LeaderCommitIndex > rf.commitIndex {
@@ -293,7 +332,7 @@ func (rf *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 		// grant the vote
 		reply.VotedGranted = true
 		rf.votedFor = args.CandidateId
-
+		rf.persist()
 		// postpone the election (reset the timeout)
 		rf.nextElectionTime = time.Now().Add(generateRandomTimeout())
 	}
@@ -416,13 +455,24 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 			rf.logConsumer(serverId, "AppendEntries Rejected but no need to retry as leader nextIndex has changed")
 			return
 		}
-		rf.nextIndex[serverId]--
+		// backoff according to the protocol to accelerate agreement
+		if rf.log[reply.ConflictIndex].Term != reply.ConflictTerm {
+			rf.nextIndex[serverId] = reply.ConflictIndex
+		} else {
+			rf.nextIndex[serverId] = reply.ConflictIndex
+			for i := args.PrevLogIndex - 1; i >= reply.ConflictIndex; i-- {
+				if reply.ConflictTerm == rf.log[i].Term {
+					rf.nextIndex[serverId] = i
+				}
+			}
+		}
 		//doing the retry: note that it must use the term and leaderCommit from previous AppendEntries
 		//because the term might be outdated and only outdated AppendEntries should be sent in such case
 		//e.g. the current leader might impersonate the new leader if new term is used
+		lastTimeLastIndex := len(args.Entries) + args.PrevLogIndex
 		args.PrevLogIndex = rf.getPrevLogIndex(serverId)
 		args.PrevLogTerm = rf.getPrevLogTerm(serverId)
-		args.Entries = append([]LogEntry{rf.log[rf.nextIndex[serverId]]}, args.Entries...)
+		args.Entries = rf.log[rf.nextIndex[serverId] : lastTimeLastIndex+1]
 		rf.logConsumer(serverId, "AppendEntries Rejected and Retry after decrement the next index into %d", rf.nextIndex[serverId])
 		go rf.sendAndHandleAppendEntries(serverId, args)
 	}
@@ -489,7 +539,9 @@ func (rf *Raft) commitObserver() {
 		// to avoid blocking while holding lock, apply outside the lock
 		for _, msg := range applyQueue {
 			rf.applyChannel <- msg
+			rf.mu.Lock()
 			rf.logServer("The log entries up to index %d has been applied!", msg.CommandIndex)
+			rf.mu.Unlock()
 		}
 		// Reset the slice length to zero
 		applyQueue = applyQueue[:0]
@@ -536,6 +588,7 @@ func (rf *Raft) runForCandidate() {
 	rf.identity = CANDIDATE
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.persist()
 	// define shared states for threads responsible for sending RequestVote and gathering vote
 	// These variables can be loaded and modified in each thread using Closure
 	// alternative approaches to closure is passing pointer of struct
@@ -616,6 +669,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := len(rf.log)
 	// update log and matchIndex of itself
 	rf.log = append(rf.log, LogEntry{Command: command, Index: index, Term: rf.currentTerm})
+	rf.persist()
 	rf.matchIndex[rf.me] = rf.getLastLogIndex()
 	// send appendEntries to all other servers, don't restart heartbeat timer for faster update
 	rf.broadcastAppendEntries(false)
@@ -716,6 +770,7 @@ func (rf *Raft) compareTermAndUpdateStates(term int) bool {
 		}
 		rf.identity = FOLLOWER
 		rf.votedFor = -1 // not voted in the Term
+		rf.persist()
 		return true
 	}
 	return false
