@@ -18,18 +18,16 @@ package raft
 //
 
 import (
-	"6.824/labgob"
 	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
 	"time"
 
-	//	"bytes"
+	"6.824/labgob"
+	"6.824/labrpc"
 	"sync"
 	"sync/atomic"
-	//	"6.824/labgob"
-	"6.824/labrpc"
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -54,6 +52,12 @@ type ApplyMsg struct {
 }
 type ServerIdentity int32
 
+const (
+	LEADER ServerIdentity = iota
+	CANDIDATE
+	FOLLOWER
+)
+
 func (identity ServerIdentity) String() string {
 	switch identity {
 	case LEADER:
@@ -72,11 +76,6 @@ const (
 	MAX_ELECTION_TIMEOUT_MILLIS  int64 = 1000
 	APPEND_ENTRIES_PERIOD_MILLIS int64 = 100
 	TICKER_PERIOD_MILLIS         int64 = 30
-)
-const (
-	LEADER ServerIdentity = iota
-	CANDIDATE
-	FOLLOWER
 )
 
 // A Go object implementing a single Raft peer.
@@ -104,6 +103,10 @@ type Raft struct {
 	nextIndex  []int //for each server, index of the next log entry to send to that server
 	matchIndex []int // for each server, index of the highest log entry known to be replicated on server
 
+	// snapshot and related fields
+	snapshot          []byte
+	snapshotLastIndex int // last index included in snapshot
+	snapshotLastTerm  int // the term of last index included in snapshot
 }
 
 // A single entry in log
@@ -144,6 +147,13 @@ func (rf *Raft) persist() {
 	if e.Encode(rf.log) != nil {
 		rf.logServer("Failed to encode log!")
 	}
+	if e.Encode(rf.snapshotLastIndex) != nil {
+		rf.logServer("Failed to encode the last term in snapshot!")
+	}
+	if e.Encode(rf.snapshotLastTerm) != nil {
+		rf.logServer("Failed to encode the last index in snapshot!")
+	}
+
 	data := writeBuffer.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -159,20 +169,30 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
+	var snapshotLastIndex int
+	var snapshotLastTerm int
 	if d.Decode(&currentTerm) != nil {
-		rf.logServer("Failed to read current term from persistent state!")
+		rf.logServer("Failed to read current term from persistent states!")
 	}
 	if d.Decode(&votedFor) != nil {
-		rf.logServer("Failed to read who the server voted for from persistent state")
+		rf.logServer("Failed to read who the server voted for from persistent states!")
 	}
 	if d.Decode(&log) != nil {
-		rf.logServer("Failed to read log from persistent state")
+		rf.logServer("Failed to read log from persistent states!")
+	}
+	if d.Decode(&snapshotLastIndex) != nil {
+		rf.logServer("Failed to read the last index in snapshot from persistent states!")
+	}
+	if d.Decode(&snapshotLastTerm) != nil {
+		rf.logServer("Failed to read the last term in snapshot from persistent states!")
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = log
+	rf.snapshotLastIndex = snapshotLastIndex
+	rf.snapshotLastTerm = snapshotLastTerm
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -230,6 +250,20 @@ type AppendEntriesReply struct {
 	//  instruction about the index that the Leader should send entries from to accelerate success
 	ConflictIndex int
 	ConflictTerm  int
+}
+
+// The message from leader to a node if the log of that node is way too lagging behind
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	data              []byte
+}
+
+// InstallSnapshot RPC reply structure
+type InstallSnapshotReply struct {
+	Term int
 }
 
 // AppendEntriees RPC handler
@@ -502,7 +536,7 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// Observe events involving commits, increment lastApplied and apply to the state machine
+// Observe events involving commits, increment lastApplied and apply to the state machine by sending applyMsg to the service
 func (rf *Raft) commitObserver() {
 	// Because the loop is not entirely locked, some notification might be missed while not waiting
 	// Last resort is to periodically notify the observer to check if apply is available
@@ -717,7 +751,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		applyChannel:      applyCh,
 		currentTerm:       0,
 		votedFor:          -1,
-		log:               make([]LogEntry, 1), // include a sentinel logEntry
+		log:               make([]LogEntry, 0),
 		commitIndex:       0,
 		lastApplied:       0,
 		identity:          FOLLOWER,
@@ -725,13 +759,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		nextHeartbeatTime: time.Now(),                              // not important as not started as a leader
 		nextIndex:         make([]int, len(peers)),                 // only used by leader, reinitialize then
 		matchIndex:        make([]int, len(peers)),                 // only used by leader, reinitialize then
+		snapshot:          nil,
+		snapshotLastIndex: 0,
+		snapshotLastTerm:  0,
 	}
 	// associate conditional variables
 	rf.commitCond = sync.NewCond(&rf.mu)
 	// TODO : reconcile the initialization from nothing (above written by me) and from crash (below given)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	rf.snapshot = persister.ReadSnapshot()
 	go rf.ticker()
 	go rf.commitObserver()
 
