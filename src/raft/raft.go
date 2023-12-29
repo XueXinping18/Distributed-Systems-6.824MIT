@@ -18,16 +18,15 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"6.824/labrpc"
 	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
-	"time"
-
-	"6.824/labgob"
-	"6.824/labrpc"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -216,20 +215,31 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.logServer("Service called Snapshot...")
 	if index < rf.snapshotLastIndex {
-		log.Fatalf("Server %d: ERROR: snapshot last index decreased!", rf.me)
+		log.Fatalf("Server %d: ERROR: Snapshot last index decreased!", rf.me)
 	}
 	if index == rf.snapshotLastIndex {
 		// duplicated snapshot, do nothing
-		rf.logServer("Warning: snapshot received from the service has the same index as maintained by Raft states")
+		rf.logServer("Warning: Snapshot received from the service has the same index as maintained by Raft states")
 		return
 	}
-	prev := rf.snapshotLastIndex
-	rf.snapshotLastTerm = rf.getLogEntryTerm(index)
-	rf.snapshotLastIndex = index
+	rf.logServer("Before Snapshotting...")
+	rf.logAllIndices()
+	prev := rf.snapshotLastIndex // for logging
+	rf.snapshot = snapshot
+
+	// The order of the next 3 updates are very important!
+	rf.snapshotLastTerm = rf.getLogEntryTerm(index) // must happen before truncation. Once truncated the term is not accessible
+
+	rf.truncateLogUpTo(index) // must happen before update snapshot last index, because truncation needs the last index to be correct to calculate offset
+
+	rf.snapshotLastIndex = index // must happen after the other two
+
 	rf.logServer("Snapshot updated from the service: last Index increased from %d to %d.", prev, index)
 	// TODO: check no reference remains
-	rf.truncateLogUpTo(index)
+	rf.logServer("After Snapshotting...")
+	rf.logAllIndices()
 }
 
 // The message from candidate to other nodes to request votes
@@ -375,7 +385,6 @@ func (rf *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	reply.Term = rf.currentTerm
 	reply.VotedGranted = false
 
-	// TODO: potential issue: count of duplicate votes
 	// decide if grant vote
 	if rf.shouldGrantVote(args.CandidateId,
 		args.Term,
@@ -616,7 +625,7 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 	for i := 0; i < len(rf.peers); i++ {
 		if rf.me != i {
 			var entries []LogEntry
-			// to have better performance, we make heartbeat sending log entries
+			// to have better performance, we make both heartbeats or non-heartbeats sending log entries
 			if rf.getLastLogIndex() >= rf.nextIndex[i] {
 				entries = rf.log[rf.indexToLogOffset(rf.nextIndex[i]):]
 			}
@@ -817,8 +826,8 @@ func (rf *Raft) getLastLogIndex() int {
 func (rf *Raft) getPrevLogTerm(serverId int) int {
 	index := rf.getPrevLogIndex(serverId)
 	if index < rf.snapshotLastIndex {
-		rf.logServer("Attempted to obtain the term of a log entry that has been replaced by snapshot! -1 returned!")
-		return -1 // we don't know the term because it is early part of snapshot
+		rf.logServer("Attempted to obtain the term of a log entry that has been replaced by snapshot! -2 returned!")
+		return -2 // we don't know the term because it is early part of snapshot
 	} else if index == rf.snapshotLastIndex {
 		return rf.snapshotLastTerm
 	} else {
@@ -957,6 +966,7 @@ func (rf *Raft) getLogEntry(index int) LogEntry {
 func (rf *Raft) getLogEntryTerm(index int) int {
 	logOffset := rf.indexToLogOffset(index)
 	if logOffset < -1 {
+		//debug.PrintStack()
 		log.Fatalf("Server-%d: ERROR: try to access term of log entry that has been replaced by snapshot!", rf.me)
 	}
 	if logOffset >= len(rf.log) {
@@ -997,4 +1007,12 @@ func min(x int, y int) int {
 		return x
 	}
 	return y
+}
+func (rf *Raft) logAllIndices() {
+	rf.logServer("-----Start to log all indices!-----")
+	rf.logServer("The last index is %d", rf.snapshotLastIndex)
+	for i, entry := range rf.log {
+		rf.logServer("The next element in log with offset %d has index %d", i, entry.Index)
+	}
+	rf.logServer("-----Finished to log all indices!-----")
 }
