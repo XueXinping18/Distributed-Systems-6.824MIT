@@ -214,6 +214,13 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that Index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	if index < rf.snapshotLastIndex {
+		log.Fatalf("Server %d: ERROR: snapshot last index decreased!", rf.me)
+	}
+	if index == rf.snapshotLastIndex {
+		// duplicated snapshot, do nothing
+		return
+	}
 
 }
 
@@ -799,12 +806,12 @@ func (rf *Raft) getLastLogIndex() int {
 func (rf *Raft) getPrevLogTerm(serverId int) int {
 	index := rf.getPrevLogIndex(serverId)
 	if index < rf.snapshotLastIndex {
+		rf.logServer("Attempted to obtain the term of a log entry that has been replaced by snapshot! -1 returned!")
 		return -1 // we don't know the term because it is early part of snapshot
 	} else if index == rf.snapshotLastIndex {
 		return rf.snapshotLastTerm
 	} else {
-		log.Fatalf("Server-%d: ERROR: Index inconsisitency found!\n", rf.me)
-		return rf.log[index-(rf.snapshotLastIndex+1)].Term
+		return rf.getLogEntry(index).Term
 	}
 }
 
@@ -854,12 +861,8 @@ func (rf *Raft) tryCommit(newlyAckedIndex int) bool {
 		log.Fatalf("Server-%d: ERROR: try to commit with index higher than the highest entry in log!", rf.me)
 		return false
 	}
-	logOffset := newlyAckedIndex - (rf.snapshotLastIndex + 1)
-	if logOffset < 0 {
-		log.Fatalf("Server-%d: ERROR: LogOffset found in tryCommit smaller than 0!", rf.me)
-	}
 	// safety requirement: don't commit log of past term until log of current term committed
-	if newlyAckedIndex <= rf.commitIndex || rf.currentTerm != rf.log[logOffset].Term {
+	if newlyAckedIndex <= rf.commitIndex || rf.currentTerm != rf.getLogEntry(newlyAckedIndex).Term {
 		return false
 	}
 	votes := 1
@@ -917,6 +920,25 @@ func generateRandomTimeout() time.Duration {
 	return time.Duration(rand.Int63n(MAX_ELECTION_TIMEOUT_MILLIS-MIN_ELECTION_TIMEOUT_MILLIS)+
 		MIN_ELECTION_TIMEOUT_MILLIS) * time.Millisecond
 }
+
+// Given the index of a log entry, get that entry (copy). Fail-fast is used for manifesting errors as early as possible
+func (rf *Raft) getLogEntry(index int) LogEntry {
+	logOffset := index - (rf.snapshotLastIndex + 1)
+	if logOffset < 0 {
+		log.Fatalf("Server-%d: ERROR: try to access entry that has been replaced by snapshot!", rf.me)
+	}
+	if logOffset >= len(rf.log) {
+		log.Fatalf("Server-%d: ERROR: Index of log overflows, length of log %d but log offset is %d!",
+			rf.me, len(rf.log), logOffset)
+	}
+	logEntry := rf.log[logOffset]
+	if logEntry.Index != index {
+		log.Fatalf("Server-%d: ERROR: Inconsistency between the log index %d and and the index field of log entry %d!",
+			rf.me, index, logEntry.Index)
+	}
+	return logEntry
+}
+
 func max(x int, y int) int {
 	if x > y {
 		return x
