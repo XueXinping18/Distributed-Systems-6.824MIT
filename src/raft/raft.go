@@ -755,7 +755,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		applyChannel:      applyCh,
 		currentTerm:       0,
 		votedFor:          -1,
-		log:               make([]LogEntry, 0),
+		log:               make([]LogEntry, 0), // with snapshot, the log index will start at 1
 		commitIndex:       0,
 		lastApplied:       0,
 		identity:          FOLLOWER,
@@ -783,17 +783,29 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 // The term of the last log entry
 func (rf *Raft) getLastLogTerm() int {
-	return rf.log[len(rf.log)-1].Term
+	if len(rf.log) == 0 {
+		return rf.snapshotLastTerm
+	} else {
+		return rf.log[len(rf.log)-1].Term
+	}
 }
 
 // The index of the last log entry
 func (rf *Raft) getLastLogIndex() int {
-	return len(rf.log) - 1
+	return rf.snapshotLastIndex + len(rf.log)
 }
 
 // The term of the log entry whose existence in a server we are ascertaining
 func (rf *Raft) getPrevLogTerm(serverId int) int {
-	return rf.log[rf.nextIndex[serverId]-1].Term
+	index := rf.getPrevLogIndex(serverId)
+	if index < rf.snapshotLastIndex {
+		return -1 // we don't know the term because it is early part of snapshot
+	} else if index == rf.snapshotLastIndex {
+		return rf.snapshotLastTerm
+	} else {
+		log.Fatalf("Server-%d: ERROR: Index inconsisitency found!\n", rf.me)
+		return rf.log[index-(rf.snapshotLastIndex+1)].Term
+	}
 }
 
 // The index of the log entry whose existence in a server we are ascertaining
@@ -836,13 +848,18 @@ func (rf *Raft) initializeLeader() {
 }
 
 // On receiving AppendEntries success message, try to see if it is possible to commit the index
+// It is guaranteed that newlyAckedIndex is in the log instead of snapshot because snapshot only has committed entries
 func (rf *Raft) tryCommit(newlyAckedIndex int) bool {
-	if newlyAckedIndex >= len(rf.log) {
+	if newlyAckedIndex >= rf.getLastLogIndex()+1 {
 		log.Fatalf("Server-%d: ERROR: try to commit with index higher than the highest entry in log!", rf.me)
 		return false
 	}
+	logOffset := newlyAckedIndex - (rf.snapshotLastIndex + 1)
+	if logOffset < 0 {
+		log.Fatalf("Server-%d: ERROR: LogOffset found in tryCommit smaller than 0!", rf.me)
+	}
 	// safety requirement: don't commit log of past term until log of current term committed
-	if newlyAckedIndex <= rf.commitIndex || rf.currentTerm != rf.log[newlyAckedIndex].Term {
+	if newlyAckedIndex <= rf.commitIndex || rf.currentTerm != rf.log[logOffset].Term {
 		return false
 	}
 	votes := 1
@@ -865,10 +882,10 @@ func (rf *Raft) tryCommit(newlyAckedIndex int) bool {
 	return false
 }
 
-// judging the rf is more updated than some other rf server given its last Term and last Index
+// determining the rf is more updated than some other rf server given its last Term and last Index
 func (rf *Raft) isMoreUpdated(lastTerm int, lastIndex int) bool {
-	rfIndex := len(rf.log) - 1
-	rfTerm := rf.log[rfIndex].Term
+	rfIndex := rf.getLastLogIndex()
+	rfTerm := rf.getLastLogTerm()
 	if rfTerm > lastTerm {
 		return true
 	}
