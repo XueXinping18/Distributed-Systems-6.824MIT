@@ -121,13 +121,13 @@ type LogEntry struct {
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
-	var isleader bool
+	var isLeader bool
 	// Your code here (2A).
 	rf.mu.Lock()
 	term = rf.currentTerm
-	isleader = rf.identity == LEADER
+	isLeader = rf.identity == LEADER
 	rf.mu.Unlock()
-	return term, isleader
+	return term, isLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -214,14 +214,22 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that Index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if index < rf.snapshotLastIndex {
 		log.Fatalf("Server %d: ERROR: snapshot last index decreased!", rf.me)
 	}
 	if index == rf.snapshotLastIndex {
 		// duplicated snapshot, do nothing
+		rf.logServer("Warning: snapshot received from the service has the same index as maintained by Raft states")
 		return
 	}
-
+	prev := rf.snapshotLastIndex
+	rf.snapshotLastTerm = rf.getLogEntryTerm(index)
+	rf.snapshotLastIndex = index
+	rf.logServer("Snapshot updated from the service: last Index increased from %d to %d.", prev, index)
+	// TODO: check no reference remains
+	rf.truncateLogUpTo(index)
 }
 
 // The message from candidate to other nodes to request votes
@@ -306,16 +314,16 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		return
 	}
 	// does not match the logEntry
-	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.getLastLogIndex()+1 <= args.PrevLogIndex || rf.getLogEntryTerm(args.PrevLogIndex) != args.PrevLogTerm {
 		reply.EntriesAccepted = false
 		// case 1: mismatch because no such entry at PrevLogIndex
-		if len(rf.log) <= args.PrevLogIndex {
-			reply.ConflictIndex = len(rf.log)
+		if rf.getLastLogIndex()+1 <= args.PrevLogIndex {
+			reply.ConflictIndex = rf.getLastLogIndex() + 1
 			reply.ConflictTerm = -1 // a different term will lead to resend from this index
 		} else {
 			// case 2: mismatch because conflicted term at PrevLogIndex
-			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
-			for i := args.PrevLogIndex; i >= 0 && rf.log[i].Term == reply.ConflictTerm; i-- {
+			reply.ConflictTerm = rf.getLogEntryTerm(args.PrevLogIndex)
+			for i := args.PrevLogIndex; i >= 0 && rf.getLogEntryTerm(i) == reply.ConflictTerm; i-- {
 				reply.ConflictIndex = i
 			}
 		}
@@ -326,12 +334,12 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	startIndex := args.PrevLogIndex + 1
 	logModified := false // the log is modified iff either happened
 	for i, entry := range args.Entries {
-		if startIndex+i >= len(rf.log) {
+		if startIndex+i >= rf.getLastLogIndex()+1 {
 			rf.log = append(rf.log, entry)
 			logModified = true
-		} else if rf.log[startIndex+i].Term != entry.Term {
+		} else if rf.getLogEntryTerm(startIndex+i) != entry.Term {
 			// by log matching rule, examining term and index is sufficient
-			rf.log = append(rf.log[:startIndex+i], entry)
+			rf.log = append(rf.log[:rf.indexToLogOffset(startIndex+i)], entry)
 			logModified = true
 		}
 	}
@@ -501,13 +509,14 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 			return
 		}
 		// backoff according to the protocol to accelerate agreement
-		if rf.log[reply.ConflictIndex].Term != reply.ConflictTerm {
+		if rf.getLogEntryTerm(reply.ConflictIndex) != reply.ConflictTerm {
 			rf.nextIndex[serverId] = reply.ConflictIndex
 		} else {
 			rf.nextIndex[serverId] = reply.ConflictIndex
 			for i := args.PrevLogIndex - 1; i >= reply.ConflictIndex; i-- {
-				if reply.ConflictTerm == rf.log[i].Term {
+				if reply.ConflictTerm == rf.getLogEntryTerm(i) {
 					rf.nextIndex[serverId] = i
+					break // TODO: examine the effect of newly added break
 				}
 			}
 		}
@@ -517,7 +526,9 @@ func (rf *Raft) sendAndHandleAppendEntries(serverId int, args *AppendEntriesArgs
 		lastTimeLastIndex := len(args.Entries) + args.PrevLogIndex
 		args.PrevLogIndex = rf.getPrevLogIndex(serverId)
 		args.PrevLogTerm = rf.getPrevLogTerm(serverId)
-		args.Entries = rf.log[rf.nextIndex[serverId] : lastTimeLastIndex+1]
+		startOffset := rf.indexToLogOffset(rf.nextIndex[serverId])
+		endOffset := rf.indexToLogOffset(lastTimeLastIndex + 1)
+		args.Entries = rf.log[startOffset:endOffset]
 		rf.logConsumer(serverId, "AppendEntries Rejected and Retry after decrement the next index into %d", rf.nextIndex[serverId])
 		go rf.sendAndHandleAppendEntries(serverId, args)
 	}
@@ -575,7 +586,7 @@ func (rf *Raft) commitObserver() {
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			applyQueue = append(applyQueue, ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[i].Command,
+				Command:      rf.getLogEntry(i).Command,
 				CommandIndex: i,
 			})
 			rf.lastApplied++
@@ -607,7 +618,7 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 			var entries []LogEntry
 			// to have better performance, we make heartbeat sending log entries
 			if rf.getLastLogIndex() >= rf.nextIndex[i] {
-				entries = rf.log[rf.nextIndex[i]:]
+				entries = rf.log[rf.indexToLogOffset(rf.nextIndex[i]):]
 			}
 			// The assembly of arguments must be in the same thread to make sure there is no
 			// interleaving increase of term. (The leader is the leader of current term not future term)
@@ -711,7 +722,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !rf.isLeader() {
 		return -1, -1, false
 	}
-	index := len(rf.log)
+	index := rf.getLastLogIndex() + 1
 	// update log and matchIndex of itself
 	rf.log = append(rf.log, LogEntry{Command: command, Index: index, Term: rf.currentTerm})
 	rf.persist()
@@ -811,7 +822,7 @@ func (rf *Raft) getPrevLogTerm(serverId int) int {
 	} else if index == rf.snapshotLastIndex {
 		return rf.snapshotLastTerm
 	} else {
-		return rf.getLogEntry(index).Term
+		return rf.getLogEntryTerm(index)
 	}
 }
 
@@ -862,7 +873,7 @@ func (rf *Raft) tryCommit(newlyAckedIndex int) bool {
 		return false
 	}
 	// safety requirement: don't commit log of past term until log of current term committed
-	if newlyAckedIndex <= rf.commitIndex || rf.currentTerm != rf.getLogEntry(newlyAckedIndex).Term {
+	if newlyAckedIndex <= rf.commitIndex || rf.currentTerm != rf.getLogEntryTerm(newlyAckedIndex) {
 		return false
 	}
 	votes := 1
@@ -922,10 +933,12 @@ func generateRandomTimeout() time.Duration {
 }
 
 // Given the index of a log entry, get that entry (copy). Fail-fast is used for manifesting errors as early as possible
+// Robust error handling is used to prevent fault snowballs quietly
+// When only tried to access term, getLogEntryTerm is preferred to incorporate the scenario of last entry of snapshot
 func (rf *Raft) getLogEntry(index int) LogEntry {
-	logOffset := index - (rf.snapshotLastIndex + 1)
+	logOffset := rf.indexToLogOffset(index)
 	if logOffset < 0 {
-		log.Fatalf("Server-%d: ERROR: try to access entry that has been replaced by snapshot!", rf.me)
+		log.Fatalf("Server-%d: ERROR: try to access entire log entry that has been replaced by snapshot!", rf.me)
 	}
 	if logOffset >= len(rf.log) {
 		log.Fatalf("Server-%d: ERROR: Index of log overflows, length of log %d but log offset is %d!",
@@ -937,6 +950,40 @@ func (rf *Raft) getLogEntry(index int) LogEntry {
 			rf.me, index, logEntry.Index)
 	}
 	return logEntry
+}
+
+// Given the index of a log entry, get that term. Fail-fast is used for manifesting errors as early as possible
+// The smallest index allowed int this function is rf.snapshotLastIndex
+func (rf *Raft) getLogEntryTerm(index int) int {
+	logOffset := rf.indexToLogOffset(index)
+	if logOffset < -1 {
+		log.Fatalf("Server-%d: ERROR: try to access term of log entry that has been replaced by snapshot!", rf.me)
+	}
+	if logOffset >= len(rf.log) {
+		log.Fatalf("Server-%d: ERROR: Index of log overflows, length of log %d but log offset is %d!",
+			rf.me, len(rf.log), logOffset)
+	}
+	if logOffset == -1 {
+		// allowing the access of last index of the snapshot
+		return rf.snapshotLastTerm
+	}
+	if rf.log[logOffset].Index != index {
+		log.Fatalf("Server-%d: ERROR: Inconsistency between the log index %d and and the index field of log entry %d!",
+			rf.me, index, rf.log[logOffset].Index)
+	}
+	return rf.log[logOffset].Term
+}
+
+// Truncate all the entries in the log up to an index
+func (rf *Raft) truncateLogUpTo(lastIndexToDelete int) {
+	logOffset := rf.indexToLogOffset(lastIndexToDelete)
+	rf.log = rf.log[logOffset+1:]
+	rf.logServer("The log has been truncated up to %d", lastIndexToDelete)
+}
+
+// map the index to the log offset (index in the slice)
+func (rf *Raft) indexToLogOffset(index int) int {
+	return index - (rf.snapshotLastIndex + 1)
 }
 
 func max(x int, y int) int {
