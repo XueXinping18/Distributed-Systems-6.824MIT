@@ -72,11 +72,10 @@ func (identity ServerIdentity) String() string {
 }
 
 const (
-	MIN_ELECTION_TIMEOUT_MILLIS         int64 = 500
-	MAX_ELECTION_TIMEOUT_MILLIS         int64 = 1000
-	APPEND_ENTRIES_PERIOD_MILLIS        int64 = 100
-	TICKER_PERIOD_MILLIS                int64 = 30
-	SNAPSHOT_NOTIFICATION_PERIOD_MILLIS int64 = 60
+	MIN_ELECTION_TIMEOUT_MILLIS  int64 = 500
+	MAX_ELECTION_TIMEOUT_MILLIS  int64 = 1000
+	APPEND_ENTRIES_PERIOD_MILLIS int64 = 100
+	TICKER_PERIOD_MILLIS         int64 = 30
 )
 
 // A Go object implementing a single Raft peer.
@@ -153,16 +152,40 @@ func (rf *Raft) persist() {
 	if e.Encode(rf.snapshotLastTerm) != nil {
 		rf.logServer("Failed to encode the last index in snapshot!")
 	}
+	data := writeBuffer.Bytes()
+	rf.persister.SaveRaftState(data)
+}
 
+// used when both snapshot and states changed
+func (rf *Raft) persistWithSnapshot() {
+	rf.logServer("Save the server states to stable storage!")
+	writeBuffer := new(bytes.Buffer)
+	e := labgob.NewEncoder(writeBuffer)
+	if e.Encode(rf.currentTerm) != nil {
+		rf.logServer("Failed to encode current term!")
+	}
+	if e.Encode(rf.votedFor) != nil {
+		rf.logServer("Failed to encode who the server voted for!")
+	}
+	if e.Encode(rf.log) != nil {
+		rf.logServer("Failed to encode log!")
+	}
+	if e.Encode(rf.snapshotLastIndex) != nil {
+		rf.logServer("Failed to encode the last term in snapshot!")
+	}
+	if e.Encode(rf.snapshotLastTerm) != nil {
+		rf.logServer("Failed to encode the last index in snapshot!")
+	}
 	data := writeBuffer.Bytes()
 	// according to protocol, empty snapshot should be saved as nil
 	if len(rf.snapshot) == 0 {
 		rf.snapshot = nil
 	}
+
 	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
 }
 
-// restore previously persisted state.
+// restore previously persisted Raft state. Used only when the server restarts (from crash) along with read snapshot
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -197,13 +220,20 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.log = newLog
 	rf.snapshotLastIndex = snapshotLastIndex
 	rf.snapshotLastTerm = snapshotLastTerm
+
+	// restore volatile states according to persistent states
+	rf.commitIndex = max(rf.commitIndex, rf.snapshotLastIndex)
+	// we do not restore rf.lastApplied because it is likely that the snapshot is not applied but persisted
+	// In the case where the snapshot is installed from a peer (installSnapshot) and persisted successfully but not applied
+	// to the state machine before the server crash.
+
+	// Idempotence of the operations guaranteed the correctness when duplicated applies happened after crash.
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
+// Deprecated in Spring 2022 version of this lab, simply return true
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
 
 	return true
 }
@@ -234,8 +264,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.replaceSnapshotAndUpdate(snapshot, index, lastTerm)
 
+	rf.persistWithSnapshot()
 	rf.logServer("Snapshot updated from the service: last Index increased from %d to %d.", prev, index)
-
 }
 
 // Replace the snapshot with a new snapshot, should be called only if the snapshot is believed more up-to-date
@@ -466,7 +496,7 @@ func (rf *Raft) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *InstallS
 		rf.logProducer(args.LeaderId, "Accept of InstallSnapshot increases the commitIndex from %d to %d", prev, rf.commitIndex)
 
 	}
-	rf.persist()
+	rf.persistWithSnapshot()
 	rf.logProducer(args.LeaderId, "Finished the handling of InstallSnapshot request")
 }
 
@@ -685,6 +715,7 @@ func (rf *Raft) ticker() {
 }
 
 // Observe events involving commits, increment lastApplied and apply to the state machine by sending applyMsg to the service
+// Without crash, each entry is applied exactly once!
 func (rf *Raft) commitObserver() {
 	// Because the loop is not entirely locked, some notification might be missed while not waiting
 	// Last resort is to periodically notify the observer to check if apply is available
@@ -709,6 +740,8 @@ func (rf *Raft) commitObserver() {
 			}
 			rf.commitCond.Wait()
 		}
+		var lastAddedToApplyQueue int
+		lastAddedToApplyQueue = rf.lastApplied
 		// if the committed index cannot be accessed by indexing the log, deliver the corresponding snapshot
 		if rf.lastApplied < rf.snapshotLastIndex {
 			applyQueue = append(applyQueue, ApplyMsg{
@@ -717,21 +750,28 @@ func (rf *Raft) commitObserver() {
 				SnapshotTerm:  rf.snapshotLastTerm,
 				SnapshotIndex: rf.snapshotLastIndex,
 			})
-			rf.lastApplied = rf.snapshotLastIndex
+			lastAddedToApplyQueue = rf.snapshotLastIndex
 		}
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		for i := lastAddedToApplyQueue + 1; i <= rf.commitIndex; i++ {
 			applyQueue = append(applyQueue, ApplyMsg{
 				CommandValid: true,
 				Command:      rf.getLogEntry(i).Command,
 				CommandIndex: i,
 			})
-			rf.lastApplied++
 		}
 		rf.mu.Unlock()
 		// to avoid blocking while holding lock, apply outside the lock
+		// the queue has entries in following structure:
+		// The first entry might or might not be a snapshot entry
+		// All the following entry must be a command entry
 		for _, msg := range applyQueue {
 			rf.applyChannel <- msg
 			rf.mu.Lock()
+			if msg.SnapshotValid {
+				rf.lastApplied = msg.SnapshotIndex
+			} else {
+				rf.lastApplied++
+			}
 			rf.logServer("The log entries up to index %d has been applied!", msg.CommandIndex)
 			rf.mu.Unlock()
 		}
@@ -757,7 +797,6 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 				rf.nextIndex[i] = rf.snapshotLastIndex + 1
 			}
 			if rf.getLastLogIndex() >= rf.nextIndex[i] {
-				// TODO: out of bound ERROR, too small
 				entries = rf.log[rf.indexToLogOffset(rf.nextIndex[i]):]
 			}
 			// The assembly of arguments must be in the same thread to make sure there is no
@@ -856,7 +895,6 @@ func (rf *Raft) runForCandidate() {
 // Term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if !rf.isLeader() {
@@ -927,8 +965,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	// associate conditional variable
 	rf.commitCond = sync.NewCond(&rf.mu)
-	// TODO : reconcile the initialization from nothing (above written by me) and from crash (below given)
 	// initialize from state persisted before a crash
+	// in principle the next 2 operations should be atomic. But initialization stage doesn't handle RPCs yet
 	rf.readPersist(persister.ReadRaftState())
 	rf.snapshot = persister.ReadSnapshot()
 	go rf.ticker()
