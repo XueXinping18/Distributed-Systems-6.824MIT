@@ -91,6 +91,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	applyChannel      chan ApplyMsg
 	currentTerm       int // The term it is in
+	LeaderId          int // The leader of current term, -1 represents unknown. used for redirection
 	votedFor          int // -1 represents not voted yet
 	log               []LogEntry
 	commitIndex       int // serves as the right boundary of a slicing window
@@ -344,6 +345,7 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 
 	// reset election timeout if AppendEntries are from leader of current term
 	if args.Term == rf.currentTerm {
+		rf.LeaderId = args.LeaderId
 		rf.nextElectionTime = time.Now().Add(generateRandomTimeout())
 		if rf.identity == CANDIDATE {
 			// give up the election if someone else declared winning
@@ -477,6 +479,9 @@ func (rf *Raft) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *InstallS
 	rf.logProducer(args.LeaderId, "Received InstallSnapshot request")
 	// update the Term and identity if higher term encountered on receiving RPC message
 	rf.compareTermAndUpdateStates(args.Term)
+	if args.Term == rf.currentTerm {
+		rf.LeaderId = args.LeaderId // update LeaderId
+	}
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.snapshotLastIndex {
 		// outdated or repeated snapshot, ignore
@@ -822,6 +827,7 @@ func (rf *Raft) runForCandidate() {
 	rf.logServer("Server declared as a CANDIDATE")
 	rf.identity = CANDIDATE
 	rf.currentTerm += 1
+	rf.LeaderId = -1 // set Leader as unknown
 	rf.votedFor = rf.me
 	rf.persist()
 	// define shared states for threads responsible for sending RequestVote and gathering vote
@@ -884,8 +890,9 @@ func (rf *Raft) runForCandidate() {
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next Command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
+// server isn't the leader, returns false. And the first and second
+// value will be the leaderId and term that the node knows otherwise start
+// the agreement and return immediately. there is no guarantee that this
 // Command will ever be committed to the Raft log, since the leader
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
@@ -898,7 +905,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if !rf.isLeader() {
-		return -1, -1, false
+		return rf.LeaderId, rf.currentTerm, false
 	}
 	index := rf.getLastLogIndex() + 1
 	// update log and matchIndex of itself
@@ -950,6 +957,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		dead:              0,
 		applyChannel:      applyCh,
 		currentTerm:       0,
+		LeaderId:          -1,
 		votedFor:          -1,
 		log:               make([]LogEntry, 0), // with snapshot, the log index will start at 1
 		commitIndex:       0,
@@ -1014,6 +1022,7 @@ func (rf *Raft) compareTermAndUpdateStates(term int) bool {
 	if term > rf.currentTerm {
 		rf.logServer("Higher term encountered!")
 		rf.currentTerm = term
+		rf.LeaderId = -1 // by default the server does not know the ID of new leader
 		if rf.isLeader() {
 			rf.logServer("Step down from leader!")
 		}
@@ -1033,6 +1042,7 @@ func (rf *Raft) isLeader() bool {
 // initialize when a server turns into leader
 func (rf *Raft) initializeLeader() {
 	rf.identity = LEADER
+	rf.LeaderId = rf.me
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = rf.getLastLogIndex() + 1
 	}
@@ -1090,16 +1100,21 @@ func (rf *Raft) requiredVotesToWin() int {
 	return (len(rf.peers))/2 + 1
 }
 
+// define logging format for nonRPC messages
 func (rf *Raft) logServer(format string, args ...interface{}) {
 	prefix := fmt.Sprintf("TERM-%d Server-%d: ", rf.currentTerm, rf.me)
 	message := prefix + format + "\n"
 	log.Printf(message, args...)
 }
+
+// define logging format for RPC messages where the current server act as the RPC producer (request sender)
 func (rf *Raft) logProducer(consumerId int, format string, args ...interface{}) {
 	prefix := fmt.Sprintf("TERM-%d %d->%d:", rf.currentTerm, consumerId, rf.me)
 	message := prefix + format + "\n"
 	log.Printf(message, args...)
 }
+
+// define logging format for RPC messages where the current server act as the RPC consumer (request receiver)
 func (rf *Raft) logConsumer(producerId int, format string, args ...interface{}) {
 	prefix := fmt.Sprintf("TERM-%d %d->%d: ", rf.currentTerm, rf.me, producerId)
 	message := prefix + format + "\n"
