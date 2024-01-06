@@ -10,12 +10,11 @@ import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
-	servers  []*labrpc.ClientEnd
-	uid      int64
-	base64Id string // for logging purpose
+	servers        []*labrpc.ClientEnd
+	uid            int64
+	base64IdPrefix string // for logging purpose
 	// Clerk prefers to talk to a known leader, otherwise try randomly
-	suggestedLeader int   // Record the suggestion of which server to send
-	suggestedTerm   int   // Record the term of that leader for comparison purpose
+	preferredServer int   // Record the previous server that the clerk successfully communicated with
 	nextSeqNum      int32 // atomically increase for SeqNum
 }
 
@@ -35,10 +34,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	// assign a unique ID for the clerk
 	ck.uid = nrand()
-	ck.base64Id = int64ToBase64(ck.uid)
+	ck.base64IdPrefix = base64Prefix(ck.uid)
 	ck.nextSeqNum = 0
-	ck.suggestedTerm = -1
-	ck.suggestedLeader = -1
+	ck.preferredServer = -1
 	return ck
 }
 
@@ -60,6 +58,7 @@ func (ck *Clerk) Get(key string) string {
 		ClerkId: ck.uid,
 		SeqNum:  int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
+	ck.logClerk(false, "Client issues GET operation with key "+key+".")
 	return ck.Operation(args)
 }
 func (ck *Clerk) Put(key string, value string) {
@@ -70,6 +69,7 @@ func (ck *Clerk) Put(key string, value string) {
 		ClerkId: ck.uid,
 		SeqNum:  int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
+	ck.logClerk(false, "Client issues PUT operation with key "+key+" and value "+value+".")
 	ck.Operation(args)
 }
 func (ck *Clerk) Append(key string, value string) {
@@ -80,6 +80,7 @@ func (ck *Clerk) Append(key string, value string) {
 		ClerkId: ck.uid,
 		SeqNum:  int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
+	ck.logClerk(false, "Client issues APPEND operation with key "+key+" and value "+value+".")
 	ck.Operation(args)
 }
 
@@ -90,30 +91,31 @@ func (ck *Clerk) Append(key string, value string) {
 func (ck *Clerk) Operation(args *OperationArgs) string {
 	var reply *OperationReply
 	seqNum := args.SeqNum
-	for {
-		// reset reply struct
+	count := 0
+	for done := false; !done; {
+		ck.logClerk(false, "The number of attempt to send the operation for the SeqNum %d is %d. Do the next attempt!",
+			seqNum, count)
+		// reset reply struct for every retry
 		reply = new(OperationReply)
 		var serverId int
 		// decide which leader to choose
-		if ck.suggestedLeader == -1 {
+		if ck.preferredServer == -1 {
 			serverId = ck.chooseRandomServer()
+			ck.logRPC(false, seqNum, serverId, "Decide to select server handle %d in random", serverId)
 		} else {
-			serverId = ck.suggestedLeader
+			serverId = ck.preferredServer
+			ck.logRPC(false, seqNum, serverId, "Decide to select server handle %d as previously did", serverId)
 		}
+		// Doing RPC to the server.
+		// Note that serverId in client side and server side is different for the same server
 		ok := ck.servers[serverId].Call("KVServer.HandleOperation", args, reply)
+
+		// handle the RPC reply and potentially retry, update the preferred server to send
 		if !ok {
 			// message lost, retry with a random server
 			ck.logRPC(false, seqNum, serverId, "Message Lost in traffic (either request or response)")
-			ck.suggestedLeader, ck.suggestedTerm = -1, -1
+			ck.preferredServer = -1
 		} else {
-			// check invariance: if one is invalid, both are invalid
-			if (reply.LeaderId == -1 || reply.TermId == -1) && reply.LeaderId != reply.TermId {
-				ck.logRPC(true, seqNum, serverId, "ERROR: Invariant break w.r.t. LeaderId and TermId!")
-			}
-			// received reply: update the suggested leader if
-			if reply.TermId > ck.suggestedTerm || reply.LeaderId == -1 {
-				ck.suggestedLeader, ck.suggestedTerm = reply.LeaderId, reply.TermId
-			}
 			// decide what action to do according to error term, validate invariance
 			switch reply.Err {
 			case ErrOutOfOrderDelivery:
@@ -121,38 +123,49 @@ func (ck *Clerk) Operation(args *OperationArgs) string {
 				ck.logRPC(true, seqNum, serverId, "ERROR: In RPC api, out of order delivery in synchronous scenario is not possible")
 			case ErrLogEntryErased:
 				ck.logRPC(false, seqNum, serverId, "Client notified that log entry has been erased, retry!")
+				ck.preferredServer = -1
 			case ErrWrongLeader:
 				ck.logRPC(false, seqNum, serverId, "Client notified that the server is not leader, retry another server!")
+				ck.preferredServer = -1
 			case ErrNoKey:
+				ck.preferredServer = serverId
 				// success
 				if reply.Value != "" || args.Type != GET {
-					ck.logRPC(true, seqNum, serverId, "ERROR: Inconsistency found with ErrNoKey!")
+					ck.logRPC(true, seqNum, serverId, "ERROR: ErrNoKey replied for non-GET operation!")
 				}
 				ck.logRPC(false, seqNum, serverId, "The Get request with key not existed in the state machine!")
-				break
+				done = true // break the loop
 			case OK:
+				ck.preferredServer = serverId
 				// success
 				ck.logRPC(false, seqNum, serverId, "The request returns successfully!")
-				break
+				done = true // break the loop
 			}
 		}
+		count++
 	}
 	return reply.Value
 }
 
 func (ck *Clerk) logClerk(fatal bool, format string, args ...interface{}) {
-	prefix := "Clerk-" + ck.base64Id + ": "
+	if !Debug {
+		return
+	}
+	prefix := "Clerk-" + ck.base64IdPrefix + ": "
 	message := fmt.Sprintf(format, args...)
 	if fatal {
-		log.Println(prefix + message)
-	} else {
 		log.Fatalln(prefix + message)
+	} else {
+		log.Println(prefix + message)
 	}
 }
 func (ck *Clerk) logRPC(fatal bool, seqNum int, serverId int, format string, args ...interface{}) {
-	prefixClerk := "Clerk-" + ck.base64Id + " "
+	if !Debug {
+		return
+	}
+	prefixClerk := "Clerk-" + ck.base64IdPrefix + " "
 	prefixSeq := fmt.Sprintf("Seq-%d ", seqNum)
-	prefixService := fmt.Sprintf("Service-%d: ", serverId)
+	prefixService := fmt.Sprintf("ServiceHandle-%d: ", serverId)
 	message := fmt.Sprintf(format, args...)
 	if fatal {
 		log.Fatalln(prefixClerk + prefixSeq + prefixService + message)

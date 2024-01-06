@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 )
 
+// used to control whether or not print debugging info
+const Debug = true
 const (
 	OK                    = "OK"
 	ErrNoKey              = "ErrNoKey"
@@ -13,6 +15,7 @@ const (
 	ErrOutOfOrderDelivery = "ErrOutOfOrderDelivery"
 	ErrLogEntryErased     = "ErrLogEntryErased"
 )
+const PrefixLength = 5
 
 type OperationType int
 
@@ -38,9 +41,6 @@ type OperationArgs struct {
 type OperationReply struct {
 	Err   Err
 	Value string // only used by Get
-	// used for the client to redirect message to leader
-	LeaderId int
-	TermId   int
 }
 
 // int64ToBase64 converts an int64 number to a base64 encoded string.
@@ -49,12 +49,8 @@ func int64ToBase64(number int64) string {
 	bytes := []byte(strconv.FormatInt(number, 10))
 	return base64.StdEncoding.EncodeToString(bytes)
 }
-
-func max(a int, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+func base64Prefix(number int64) string {
+	return int64ToBase64(number)[0:PrefixLength]
 }
 
 // used to increment an atomic number
