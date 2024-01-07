@@ -60,7 +60,7 @@ type config struct {
 }
 
 func (cfg *config) checkTimeout() {
-	// enforce a two minute real-time limit on each test
+	// enforce a two-minute real-time limit on each test
 	if !cfg.t.Failed() && time.Since(cfg.start) > 120*time.Second {
 		cfg.t.Fatal("test took longer than 120 seconds")
 	}
@@ -186,7 +186,7 @@ func (cfg *config) partition(p1 []int, p2 []int) {
 }
 
 // Create a clerk with clerk specific server names.
-// Give it connections to all of the servers, but for
+// Give it connections to all servers, but for
 // now enable only connections to servers in to[].
 func (cfg *config) makeClient(to []int) *Clerk {
 	cfg.mu.Lock()
