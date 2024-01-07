@@ -109,15 +109,6 @@ func (kv *KVServer) HandleOperation(args *OperationArgs, reply *OperationReply) 
 			" is guaranteed to have seen the response! Simply ignored!")
 		return
 	}
-	//// pruning: SeqNum to large showing that the current thread is not leader with the highest term
-	//// (although it might still believe it is the leader)
-	//if ok && args.SeqNum > cache.SeqNum+1 {
-	//	kv.logRPC(false, args.ClerkId, args.SeqNum, "Jump in sequence number"+
-	//		" The service must not be the leader of current term")
-	//	reply.Err = ErrWrongLeader
-	//	return
-	//}
-	//
 	op := Op{
 		ClerkId: args.ClerkId,
 		SeqNum:  args.SeqNum,
