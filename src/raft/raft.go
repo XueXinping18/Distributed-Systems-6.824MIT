@@ -30,6 +30,8 @@ import (
 	"time"
 )
 
+const RaftDebug bool = false
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -1102,6 +1104,9 @@ func (rf *Raft) requiredVotesToWin() int {
 
 // define logging format for nonRPC messages
 func (rf *Raft) logServer(format string, args ...interface{}) {
+	if !RaftDebug {
+		return
+	}
 	prefix := fmt.Sprintf("TERM-%d Server-%d: ", rf.currentTerm, rf.me)
 	message := prefix + format + "\n"
 	log.Printf(message, args...)
@@ -1109,6 +1114,9 @@ func (rf *Raft) logServer(format string, args ...interface{}) {
 
 // define logging format for RPC messages where the current server act as the RPC producer (request sender)
 func (rf *Raft) logProducer(consumerId int, format string, args ...interface{}) {
+	if !RaftDebug {
+		return
+	}
 	prefix := fmt.Sprintf("TERM-%d %d->%d:", rf.currentTerm, consumerId, rf.me)
 	message := prefix + format + "\n"
 	log.Printf(message, args...)
@@ -1116,6 +1124,9 @@ func (rf *Raft) logProducer(consumerId int, format string, args ...interface{}) 
 
 // define logging format for RPC messages where the current server act as the RPC consumer (request receiver)
 func (rf *Raft) logConsumer(producerId int, format string, args ...interface{}) {
+	if !RaftDebug {
+		return
+	}
 	prefix := fmt.Sprintf("TERM-%d %d->%d: ", rf.currentTerm, rf.me, producerId)
 	message := prefix + format + "\n"
 	log.Printf(message, args...)
@@ -1201,12 +1212,4 @@ func min(x int, y int) int {
 		return x
 	}
 	return y
-}
-func (rf *Raft) logAllIndices() {
-	rf.logServer("-----Start to log all indices!-----")
-	rf.logServer("The last index is %d", rf.snapshotLastIndex)
-	for i, entry := range rf.log {
-		rf.logServer("The next element in log with offset %d has index %d", i, entry.Index)
-	}
-	rf.logServer("-----Finished to log all indices!-----")
 }

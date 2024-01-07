@@ -6,9 +6,19 @@ import (
 	"6.824/raft"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+const DetectorSleepMillis int = 2000 // how long to check if the term deviated from the term a command is appended in log
+// set to be very large because the change of term does not necessarily mean that the entry will be erased. It can still
+// be committed and applied by another leader (if that leader has the replication before the term change)
+// If such detection occurs after the term changed but before the command is appended in the log, it has the risk that
+// the client being notified that the command failed and retried but the service actually applied it later on,
+// which is still safe because the clerk is guaranteed to retry the command until it succeeded, but it still incurs
+// much larger overhead.
 
 // CommandResponse is used to cache the result of the most recent command from a specific clerk
 // Because the design is synchronous, duplication with uncertainty only happens for the most recent command
@@ -24,8 +34,26 @@ type CommandResponse struct {
 type RpcContext struct {
 	ClerkId      int64
 	SeqNum       int
-	ReplyChannel chan *CommandResponse // used to reply the RPC thread and close the resource, avoiding memory leak
+	TermAppended int              // record the term that the log is appended, invalidate the request if the change of term detected
+	replyCond    *sync.Cond       // used to wake up the waiting RPC handler after response is assembled
+	Response     *CommandResponse // used by the sender thread to send the response to the receiver handler
 }
+
+// The constructor for RpcContext, mainly for bind the conditional variable to the mutex of the KVServer
+func (kv *KVServer) NewRpcContext(clerkId int64, seqNum int, term int) *RpcContext {
+	return &RpcContext{
+		ClerkId:      clerkId,
+		SeqNum:       seqNum,
+		TermAppended: term,
+		replyCond:    sync.NewCond(&kv.mu),
+		Response:     nil,
+	}
+}
+func (rpcContext *RpcContext) deliverResponseAndNotify(response *CommandResponse) {
+	rpcContext.Response = response
+	rpcContext.replyCond.Broadcast()
+}
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -46,13 +74,13 @@ type KVServer struct {
 	applyCh      chan raft.ApplyMsg
 	dead         int32 // set by Kill()
 	maxRaftState int   // snapshot if log grows this big
-	// why map of channels not conditional variable? because it can achieve that if there is a handler, then the handler
-	// will definitely receive the response immediately. If no such handler, do not block.
-	// If using conditional variable, hard to pass idiosyncratic message for each RPC handlers. (still need a map to pass the message)
+	// why map of conditional variables instead of one coarse conditional variable?
+	// If using a coarse conditional variable, hard to pass idiosyncratic message for each RPC handlers.
+	// (still need a map to pass the message)
 	// It will be wrong to share one single response without map and using broadcast to wake up all threads to find match for that response.
-	// Because it is not guaranteed that the shared response will ever be matched before updated (the producer acquires lock again
+	// Because it is not guaranteed that the field for the shared response will ever be matched before updated (the producer acquires lock again
 	// to update the response before the consumer can consume that response).
-	rpcContexts       map[int]*RpcContext // for each RPC there will be a channel for it to pass in the response
+	rpcContexts       map[int]*RpcContext // for each RPC there will be a rpcContext for it to pass in response and notify the finish of response
 	lastExecutedIndex int
 
 	stateMachine   map[string]string          // the in-memory key-value stateMachine
@@ -81,15 +109,15 @@ func (kv *KVServer) HandleOperation(args *OperationArgs, reply *OperationReply) 
 			" is guaranteed to have seen the response! Simply ignored!")
 		return
 	}
-	// pruning: SeqNum to large showing that the current thread is not leader with the highest term
-	// (although it might still believe it is the leader)
-	if ok && args.SeqNum > cache.SeqNum+1 {
-		kv.logRPC(false, args.ClerkId, args.SeqNum, "Jump in sequence number"+
-			" The service must not be the leader of current term")
-		reply.Err = ErrWrongLeader
-		return
-	}
-	// !ok || args.SeqNum == cache.SeqNum+1
+	//// pruning: SeqNum to large showing that the current thread is not leader with the highest term
+	//// (although it might still believe it is the leader)
+	//if ok && args.SeqNum > cache.SeqNum+1 {
+	//	kv.logRPC(false, args.ClerkId, args.SeqNum, "Jump in sequence number"+
+	//		" The service must not be the leader of current term")
+	//	reply.Err = ErrWrongLeader
+	//	return
+	//}
+	//
 	op := Op{
 		ClerkId: args.ClerkId,
 		SeqNum:  args.SeqNum,
@@ -97,7 +125,10 @@ func (kv *KVServer) HandleOperation(args *OperationArgs, reply *OperationReply) 
 		Key:     args.Key,
 		Value:   args.Value,
 	}
+	kv.logRPC(false, args.ClerkId, args.SeqNum, "Try to delegate the command to the Raft library")
+
 	indexOrLeader, term, success := kv.rf.Start(op)
+	kv.logRPC(false, args.ClerkId, args.SeqNum, "Finished delegation of command")
 	if !success {
 		reply.Err = ErrWrongLeader
 		kv.logRPC(false, args.ClerkId, args.SeqNum, "Service called by the clerk is not leader for term %d!", term)
@@ -109,30 +140,31 @@ func (kv *KVServer) HandleOperation(args *OperationArgs, reply *OperationReply) 
 	if ok {
 		// there is a rpcContext outstanding whose index colliding with the current index,
 		// the old entry must have been erased so that the current entry can be appended at that index
-		// give it the clerkId and seqNum for the current thread and set error so that it got resent
+
 		// Here is a very interesting corner case: if the clerkId, seqNum, index and the leaderId are all the same
 		// (which implies a different term), we can still suggest the handler to resend because next time it is
 		// most likely to be detected by duplicateTable (either during initial check or check before execution)
-		responseToStale := &CommandResponse{
-			ClerkId: args.ClerkId,
-			SeqNum:  args.SeqNum,
+		kv.logRPC(false, args.ClerkId, args.SeqNum, "There is already an RpcContext at the index where the command can reside")
+		response := &CommandResponse{
+			ClerkId: prevContext.ClerkId,
+			SeqNum:  prevContext.SeqNum,
 			Err:     ErrLogEntryErased,
 		}
-		kv.logRPC(false, args.ClerkId, args.SeqNum, "There is already an RpcContext at the index where the RpcContext can reside")
-		// TODO: no need to release lock here, because if channel in map then it must be blocking
-		prevContext.ReplyChannel <- responseToStale
+		prevContext.deliverResponseAndNotify(response)
 	}
-	currentContext := &RpcContext{
-		SeqNum:       args.SeqNum,
-		ClerkId:      args.ClerkId,
-		ReplyChannel: make(chan *CommandResponse),
-	}
+	currentContext := kv.NewRpcContext(args.ClerkId, args.SeqNum, term)
 	kv.rpcContexts[indexOrLeader] = currentContext
-	kv.mu.Unlock()
+	// If the leadership changed during waiting for reply, and the command is not erased with its index occupied by another command,
+	// e.g. serving a single client, then it might wait forever. We need to detect the change of term
+	kv.logRPC(false, args.ClerkId, args.SeqNum, "Started to wait for the apply of the command and response assembled")
 	// blocking to receive response
-	response := <-currentContext.ReplyChannel
-	kv.mu.Lock()
+	currentContext.replyCond.Wait()
 	delete(kv.rpcContexts, indexOrLeader)
+	response := currentContext.Response
+	if response == nil {
+		kv.logRPC(true, args.ClerkId, args.SeqNum, "ERROR: RPC handler woken up but the response is nil!")
+	}
+	kv.logRPC(false, args.ClerkId, args.SeqNum, "Received assembled response, wake up the RPC handler")
 	if response.SeqNum != args.SeqNum || response.ClerkId != args.ClerkId || response.Err == ErrLogEntryErased {
 		// mismatch found, the log entry must have been cleaned up
 		reply.Err = ErrLogEntryErased
@@ -176,7 +208,6 @@ func (kv *KVServer) applyChannelObserver() {
 		if applyMsg.CommandValid {
 			op := applyMsg.Command.(Op)          // type assertion into Op so that the operation can be applied
 			response := kv.validateAndApply(&op) // check if the operation is up-to-date
-			// if so, apply the operation and store the result (especially GET) to duplicateTable
 
 			// update the executed index if executed
 			if applyMsg.CommandIndex > kv.lastExecutedIndex {
@@ -187,10 +218,11 @@ func (kv *KVServer) applyChannelObserver() {
 			}
 			rpcContext, ok := kv.rpcContexts[applyMsg.CommandIndex]
 			// reply if there is a matched RPC handler
-			kv.mu.Unlock()
 			if ok {
-				rpcContext.ReplyChannel <- response
+				rpcContext.deliverResponseAndNotify(response)
+				kv.logRPC(false, response.ClerkId, response.SeqNum, "Notify the RPC handler with the reply message!")
 			}
+			kv.mu.Unlock()
 		} else if applyMsg.SnapshotValid {
 			// (3B)
 			kv.mu.Unlock()
@@ -213,6 +245,7 @@ func (kv *KVServer) validateAndApply(operation *Op) *CommandResponse {
 	var response *CommandResponse
 	if !ok || cachedEntry.SeqNum < operation.SeqNum {
 		response = kv.apply(operation)
+		// store the result (especially GET) to duplicateTable
 		kv.duplicateTable[operation.ClerkId] = response // by pointer assign to duplicateTable
 	} else if cachedEntry.SeqNum == operation.SeqNum {
 		// duplicated, need to resend reply
@@ -269,6 +302,32 @@ func (kv *KVServer) apply(operation *Op) *CommandResponse {
 	return response
 }
 
+// Periodically check if the term has changed for each ongoing RPC requests. If the term changed, different from its
+// previous term, the detector will help to generate response to client, asking the client to retry
+// Note that for safety, the command is still likely to be committed, which might be unsafe. But in the synchronous
+// setting, the client will always retry. Therefore, there is no safety issue in this particular scenario.
+func (kv *KVServer) staleRpcContextDetector() {
+	for !kv.killed() {
+		time.Sleep(time.Duration(DetectorSleepMillis) * time.Millisecond)
+		kv.mu.Lock()
+		currentTerm, isLeader := kv.rf.GetState()
+		kv.logService(false, "Current Term %d; Is server %d leader? "+strconv.FormatBool(isLeader), currentTerm, kv.me)
+		for _, rpcContext := range kv.rpcContexts {
+			if currentTerm != rpcContext.TermAppended {
+				kv.logRPC(false, rpcContext.ClerkId, rpcContext.SeqNum, "Outdated waiting rpc handler detected!")
+				reply := &CommandResponse{
+					ClerkId: rpcContext.ClerkId,
+					SeqNum:  rpcContext.SeqNum,
+					Err:     ErrTermChanged,
+				}
+				rpcContext.deliverResponseAndNotify(reply)
+				kv.logRPC(false, rpcContext.ClerkId, rpcContext.SeqNum, "Notify ErrTermChanged to the handler!")
+			}
+		}
+		kv.mu.Unlock()
+	}
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -301,6 +360,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	go kv.applyChannelObserver()
+	go kv.staleRpcContextDetector()
 	return kv
 }
 
@@ -310,9 +370,9 @@ func (kv *KVServer) logService(fatal bool, format string, args ...interface{}) {
 	if Debug {
 		prefix := fmt.Sprintf("Service-%d: ", kv.me)
 		if fatal {
-			log.Printf(prefix+format+"\n", args...)
-		} else {
 			log.Fatalf(prefix+format+"\n", args...)
+		} else {
+			log.Printf(prefix+format+"\n", args...)
 		}
 	}
 }

@@ -9,11 +9,12 @@ import (
 // used to control whether or not print debugging info
 const Debug = true
 const (
-	OK                    = "OK"
-	ErrNoKey              = "ErrNoKey"
-	ErrWrongLeader        = "ErrWrongLeader"
-	ErrOutOfOrderDelivery = "ErrOutOfOrderDelivery"
-	ErrLogEntryErased     = "ErrLogEntryErased"
+	OK                    = "OK"                    // applied
+	ErrNoKey              = "ErrNoKey"              // for GET, applied but no key
+	ErrWrongLeader        = "ErrWrongLeader"        // the server the clerk talked to is not leader
+	ErrOutOfOrderDelivery = "ErrOutOfOrderDelivery" // outdated message received, ignored
+	ErrLogEntryErased     = "ErrLogEntryErased"     // previous index is detected with a new log entry, definitely not applied
+	ErrTermChanged        = "ErrTermChanged"        // Periodic term detector found that the term of the previous leader has changed, no guarantee if the command will be applied or erased.
 )
 const PrefixLength = 5
 
