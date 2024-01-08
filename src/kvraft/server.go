@@ -222,6 +222,7 @@ func (kv *KVServer) applyChannelObserver() {
 			if kv.lastExecutedIndex >= applyMsg.SnapshotIndex {
 				kv.logService(true, "ERROR: Received from Raft a snapshot that is not more up-to-date than the current state machine")
 			}
+			kv.logService(false, "Received from Raft an entire up-to-date snapshot!")
 			kv.deserializeSnapshot(applyMsg.Snapshot)
 			if applyMsg.SnapshotIndex != kv.lastExecutedIndex {
 				kv.logService(true, "ERROR: Index deserialized from snapshot not equal to the index in the apply message!")
@@ -308,6 +309,7 @@ func (kv *KVServer) apply(operation *Op) *CommandResponse {
 // Note that for safety, the command is still likely to be committed, which might be unsafe. But in the synchronous
 // setting, the client will always retry. Therefore, there is no safety issue in this particular scenario.
 func (kv *KVServer) staleRpcContextDetector() {
+	kv.logService(false, "Start the detector for pending client requests whose log entry is outdated in term...")
 	for !kv.killed() {
 		time.Sleep(time.Duration(StaleDetectorSleepMillis) * time.Millisecond)
 		kv.mu.Lock()
@@ -331,6 +333,7 @@ func (kv *KVServer) staleRpcContextDetector() {
 
 // periodically determine if it should take a snapshot by check if state size is too large
 func (kv *KVServer) snapshotTaker() {
+	kv.logService(false, "Start the snapshot taker that periodically query if the raft state is too long...")
 	// never open up the observer to take snapshot if -1
 	if kv.maxRaftState == -1 {
 		return
@@ -350,6 +353,7 @@ func (kv *KVServer) snapshotTaker() {
 
 // serialize the state machine and duplicate table
 func (kv *KVServer) serializeSnapshot() []byte {
+	kv.logService(false, "Serialize the service states into a snapshot!")
 	writeBuffer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writeBuffer)
 	if encoder.Encode(kv.stateMachine) != nil {
@@ -385,8 +389,6 @@ func (kv *KVServer) deserializeSnapshot(data []byte) {
 	if decoder.Decode(&lastExecutedIndex) != nil {
 		kv.logService(false, "Failed to read last executed index from snapshot bytes!")
 	}
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	kv.stateMachine = stateMachine
 	kv.duplicateTable = duplicateTable
 	kv.lastExecutedIndex = lastExecutedIndex
@@ -422,6 +424,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	}
 	// You may need initialization code here.
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.logService(false, "Restart (or start) the service...")
+
 	// load states from persisted snapshot
 	kv.deserializeSnapshot(kv.rf.ReadSnapshot())
 	// You may need initialization code here.
