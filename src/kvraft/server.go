@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"math"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -219,7 +218,14 @@ func (kv *KVServer) applyChannelObserver() {
 			}
 			kv.mu.Unlock()
 		} else if applyMsg.SnapshotValid {
-			// (3B)
+			// The raft has arranged that the snapshot will be uploaded to the service only if it is more up to date
+			if kv.lastExecutedIndex >= applyMsg.SnapshotIndex {
+				kv.logService(true, "ERROR: Received from Raft a snapshot that is not more up-to-date than the current state machine")
+			}
+			kv.deserializeSnapshot(applyMsg.Snapshot)
+			if applyMsg.SnapshotIndex != kv.lastExecutedIndex {
+				kv.logService(true, "ERROR: Index deserialized from snapshot not equal to the index in the apply message!")
+			}
 			kv.mu.Unlock()
 		} else {
 			kv.logService(true, "ERROR: Neither snapshot nor command for a applyMsg!")
@@ -323,8 +329,8 @@ func (kv *KVServer) staleRpcContextDetector() {
 	}
 }
 
-// periodically determine if it should take a snapshot
-func (kv *KVServer) raftStateSizeObserver() {
+// periodically determine if it should take a snapshot by check if state size is too large
+func (kv *KVServer) snapshotTaker() {
 	// never open up the observer to take snapshot if -1
 	if kv.maxRaftState == -1 {
 		return
@@ -332,7 +338,8 @@ func (kv *KVServer) raftStateSizeObserver() {
 	for !kv.killed() {
 		time.Sleep(time.Duration(SnapshotCheckerSleepMills) * time.Millisecond)
 		kv.mu.Lock()
-		threshold := int(math.Round(0.8 * float64(kv.maxRaftState)))
+		threshold := kv.maxRaftState
+		// threshold := int(math.Round(0.8 * float64(kv.maxRaftState)))
 		if kv.rf.IsStateSizeAbove(threshold) {
 			snapshot := kv.serializeSnapshot()
 			kv.rf.Snapshot(kv.lastExecutedIndex, snapshot)
@@ -400,8 +407,8 @@ func (kv *KVServer) deserializeSnapshot(data []byte) {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
-	labgob.Register(CommandResponse{})
+	labgob.Register(Op{})              // as the command stored in logs
+	labgob.Register(CommandResponse{}) // as the response cached in duplicate table
 
 	kv := &KVServer{
 		me:                me,
@@ -415,11 +422,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	}
 	// You may need initialization code here.
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	// (3B: load duplicate table and state machine from persisted snapshot)
-
+	// load states from persisted snapshot
+	kv.deserializeSnapshot(kv.rf.ReadSnapshot())
 	// You may need initialization code here.
 	go kv.applyChannelObserver()
 	go kv.staleRpcContextDetector()
+	go kv.snapshotTaker()
 	return kv
 }
 
