@@ -19,15 +19,15 @@ This repository contains my solutions for the MIT 6.824 Distributed Systems cour
   - **Lab 2B: Raft Log Entries Append**
     - Managing log entries, replication, and maintaining consistency among followers.
   - **Lab 2C: Raft State Persistence**
-    - Ensuring the durability and reliability of the Raft state across restarts.
+    - Ensuring the durability and automatic recoverability of the Raft states in case server encounters fail-stop faults.
   - **Lab 2D: Raft Log Compaction**
-    - Implementing log compaction in Raft to handle growing log sizes and improve efficiency.
+    - Implementing log compaction in Raft to handle growing log sizes and reduce time to recover states on restarts.
 - **Similar Industry Middleware:** Apache ZooKeeper, etcd.
 
 ### Lab 3: Fault-tolerant Key/Value Service
 - **Subsections:**
   - **Lab 3A: Key/Value Service Without Snapshots**
-    - Building a key/value store based on Raft without the use of snapshots for state persistence.
+    - Building a key/value store on Raft to achieve strong consistency among replicated state machines, featured with mechanisms for duplication detection and handling of stale requests.
   - **Lab 3B: Key/Value Service With Snapshots**
     - Enhancing the key/value store with snapshot functionality for efficient state management.
 - **Similar Industry Middleware:** Redis, Amazon DynamoDB.
@@ -45,16 +45,18 @@ This repository contains my solutions for the MIT 6.824 Distributed Systems cour
 ## How to Run
 
 Please refer to the official course website (http://nil.csail.mit.edu/6.824/2022/schedule.html)
+Logging by default is turned off. For detailed logging related to clients, services or Raft instances, consider to switch the corresponding Debug variable to true.
 
 ## Implementation Details 
 
-Each section has its own documentation for implementation. Please refer to them under documents directory if interested.
+Each section has its own documentation for implementation (ongoing).
+Also, substantial comments are supplied in my code to explain how different scenarios are handled in my design, and why alternative designs might be problematic, etc.
 
 ## Skills and Concepts Acquired
 
 - Comprehensive understanding of distributed systems principles and their practical applications.
-- Hands-on experience with Raft consensus, fault tolerance, sharding, and state management.
-- Proficiency in designing scalable systems akin to industry-standard distributed systems.
+- Mastery in consensus, fault tolerance, sharding, and state management within Raft.
+- Hands-on experience in designing scalable systems akin to industry-standard distributed systems.
 - Development expertise in Go, especially for programming in concurrency.
 
 
