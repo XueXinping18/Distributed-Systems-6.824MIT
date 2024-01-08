@@ -136,50 +136,15 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
-	// Your code here (2C).
 	rf.logServer("Save the server states to stable storage!")
-	writeBuffer := new(bytes.Buffer)
-	e := labgob.NewEncoder(writeBuffer)
-	if e.Encode(rf.currentTerm) != nil {
-		rf.logServer("Failed to encode current term!")
-	}
-	if e.Encode(rf.votedFor) != nil {
-		rf.logServer("Failed to encode who the server voted for!")
-	}
-	if e.Encode(rf.log) != nil {
-		rf.logServer("Failed to encode log!")
-	}
-	if e.Encode(rf.snapshotLastIndex) != nil {
-		rf.logServer("Failed to encode the last term in snapshot!")
-	}
-	if e.Encode(rf.snapshotLastTerm) != nil {
-		rf.logServer("Failed to encode the last index in snapshot!")
-	}
-	data := writeBuffer.Bytes()
+	data := rf.serializeRaftState()
 	rf.persister.SaveRaftState(data)
 }
 
 // used when both snapshot and states changed
 func (rf *Raft) persistWithSnapshot() {
 	rf.logServer("Save the server states to stable storage!")
-	writeBuffer := new(bytes.Buffer)
-	e := labgob.NewEncoder(writeBuffer)
-	if e.Encode(rf.currentTerm) != nil {
-		rf.logServer("Failed to encode current term!")
-	}
-	if e.Encode(rf.votedFor) != nil {
-		rf.logServer("Failed to encode who the server voted for!")
-	}
-	if e.Encode(rf.log) != nil {
-		rf.logServer("Failed to encode log!")
-	}
-	if e.Encode(rf.snapshotLastIndex) != nil {
-		rf.logServer("Failed to encode the last term in snapshot!")
-	}
-	if e.Encode(rf.snapshotLastTerm) != nil {
-		rf.logServer("Failed to encode the last index in snapshot!")
-	}
-	data := writeBuffer.Bytes()
+	data := rf.serializeRaftState()
 	// according to protocol, empty snapshot should be saved as nil
 	if len(rf.snapshot) == 0 {
 		rf.snapshot = nil
@@ -188,32 +153,59 @@ func (rf *Raft) persistWithSnapshot() {
 	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
 }
 
+// define what fields to marshall
+func (rf *Raft) serializeRaftState() []byte {
+	writeBuffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writeBuffer)
+	if encoder.Encode(rf.currentTerm) != nil {
+		rf.logServer("Failed to encode current term!")
+	}
+	if encoder.Encode(rf.votedFor) != nil {
+		rf.logServer("Failed to encode who the server voted for!")
+	}
+	if encoder.Encode(rf.log) != nil {
+		rf.logServer("Failed to encode log!")
+	}
+	if encoder.Encode(rf.snapshotLastIndex) != nil {
+		rf.logServer("Failed to encode the last term in snapshot!")
+	}
+	if encoder.Encode(rf.snapshotLastTerm) != nil {
+		rf.logServer("Failed to encode the last index in snapshot!")
+	}
+	return writeBuffer.Bytes()
+}
+
+// api for the service to query if state size too large
+func (rf *Raft) IsStateSizeAbove(threshold int) bool {
+	return rf.persister.RaftStateSize() >= threshold
+}
+
 // restore previously persisted Raft state. Used only when the server restarts (from crash) along with read snapshot
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 { // bootstrap without any state
 		return
 	}
 	rf.logServer("Read from stable storage states of the server!")
 	readBuffer := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(readBuffer)
+	decoder := labgob.NewDecoder(readBuffer)
 	var currentTerm int
 	var votedFor int
 	var newLog []LogEntry
 	var snapshotLastIndex int
 	var snapshotLastTerm int
-	if d.Decode(&currentTerm) != nil {
+	if decoder.Decode(&currentTerm) != nil {
 		rf.logServer("Failed to read current term from persistent states!")
 	}
-	if d.Decode(&votedFor) != nil {
+	if decoder.Decode(&votedFor) != nil {
 		rf.logServer("Failed to read who the server voted for from persistent states!")
 	}
-	if d.Decode(&newLog) != nil {
+	if decoder.Decode(&newLog) != nil {
 		rf.logServer("Failed to read log from persistent states!")
 	}
-	if d.Decode(&snapshotLastIndex) != nil {
+	if decoder.Decode(&snapshotLastIndex) != nil {
 		rf.logServer("Failed to read the last index in snapshot from persistent states!")
 	}
-	if d.Decode(&snapshotLastTerm) != nil {
+	if decoder.Decode(&snapshotLastTerm) != nil {
 		rf.logServer("Failed to read the last term in snapshot from persistent states!")
 	}
 	rf.mu.Lock()
