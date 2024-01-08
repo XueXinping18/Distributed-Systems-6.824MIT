@@ -213,8 +213,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if decoder.Decode(&snapshotLastTerm) != nil {
 		rf.logServer("Failed to read the last term in snapshot from persistent states!")
 	}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = newLog
@@ -223,9 +221,14 @@ func (rf *Raft) readPersist(data []byte) {
 
 	// restore volatile states according to persistent states
 	rf.commitIndex = max(rf.commitIndex, rf.snapshotLastIndex)
-	// we do not restore rf.lastApplied because it is likely that the snapshot is not applied but persisted
+	// Should LastApplied be restored?
+	// I previously believe I should not restore rf.lastApplied because it is likely that the snapshot is not applied but persisted
 	// In the case where the snapshot is installed from a peer (installSnapshot) and persisted successfully but not applied
 	// to the state machine before the server crash.
+	// however, if the server crashed in between, after the restart the service will also recover from the snapshot,
+	// which will update the lastExecutedIndex field of the service to the snapshotLastIndex.
+	// Therefore, lastApplied should be restored.
+	rf.lastApplied = max(rf.lastApplied, rf.snapshotLastIndex)
 
 	// Idempotence of the operations guaranteed the correctness when duplicated applies happened after crash.
 }
@@ -243,7 +246,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // service no longer needs the log through (and including)
 // that Index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.logServer("Service called Snapshot...")
@@ -418,7 +420,7 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		}
 	}
 	rf.logProducer(args.LeaderId, "Accept AppendEntries!")
-	// persist if log modified
+	// persist if log modified, must happen before apply to the service (write-ahead logging)
 	if logModified {
 		rf.persist()
 	}
@@ -490,15 +492,16 @@ func (rf *Raft) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *InstallS
 	rf.replaceSnapshotAndUpdate(args.Data, args.LastIncludedIndex, args.LastIncludedTerm)
 	// update commitIndex, only deliver snapshot to service when commitIndex increased!
 	// Otherwise, the service might have more up-to-date snapshot
+
+	// must persist before delivery to service. Never give the opportunity of service replied to client without persist the state
+	rf.persistWithSnapshot()
 	if rf.commitIndex < rf.snapshotLastIndex {
 		prev := rf.commitIndex
 		rf.commitIndex = rf.snapshotLastIndex
 		// notify the increase of commitIndex
 		rf.commitCond.Broadcast()
 		rf.logProducer(args.LeaderId, "Accept of InstallSnapshot increases the commitIndex from %d to %d", prev, rf.commitIndex)
-
 	}
-	rf.persistWithSnapshot()
 	rf.logProducer(args.LeaderId, "Finished the handling of InstallSnapshot request")
 }
 
