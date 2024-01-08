@@ -74,10 +74,10 @@ func (identity ServerIdentity) String() string {
 }
 
 const (
-	MIN_ELECTION_TIMEOUT_MILLIS  int64 = 500
-	MAX_ELECTION_TIMEOUT_MILLIS  int64 = 1000
-	APPEND_ENTRIES_PERIOD_MILLIS int64 = 100
-	TICKER_PERIOD_MILLIS         int64 = 30
+	MinElectionTimeoutMillis  int64 = 500
+	MaxElectionTimeoutMillis  int64 = 1000
+	AppendEntriesPeriodMillis int64 = 100
+	TickerPeriodMillis        int64 = 30
 )
 
 // A Go object implementing a single Raft peer.
@@ -715,7 +715,7 @@ func (rf *Raft) ticker() {
 			rf.runForCandidate()
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(TICKER_PERIOD_MILLIS) * time.Millisecond)
+		time.Sleep(time.Duration(TickerPeriodMillis) * time.Millisecond)
 	}
 }
 
@@ -727,7 +727,7 @@ func (rf *Raft) commitObserver() {
 	go func() {
 		rf.logServer("The timer to send notifications for applying command started!")
 		for !rf.killed() {
-			time.Sleep(time.Duration(TICKER_PERIOD_MILLIS) * time.Millisecond)
+			time.Sleep(time.Duration(TickerPeriodMillis) * time.Millisecond)
 			// wrapped in lock to reduce the number of missed notifications
 			rf.mu.Lock()
 			rf.commitCond.Broadcast()
@@ -790,7 +790,7 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 
 	// must update the next broadcast time if it is heartbeat
 	if isHeartbeat {
-		rf.nextHeartbeatTime = time.Now().Add(time.Duration(APPEND_ENTRIES_PERIOD_MILLIS) * time.Millisecond)
+		rf.nextHeartbeatTime = time.Now().Add(time.Duration(AppendEntriesPeriodMillis) * time.Millisecond)
 	}
 
 	rf.logServer("BroadCast AppendEntries Messages...")
@@ -1130,8 +1130,8 @@ func (rf *Raft) logConsumer(producerId int, format string, args ...interface{}) 
 	log.Printf(message, args...)
 }
 func generateRandomTimeout() time.Duration {
-	return time.Duration(rand.Int63n(MAX_ELECTION_TIMEOUT_MILLIS-MIN_ELECTION_TIMEOUT_MILLIS)+
-		MIN_ELECTION_TIMEOUT_MILLIS) * time.Millisecond
+	return time.Duration(rand.Int63n(MaxElectionTimeoutMillis-MinElectionTimeoutMillis)+
+		MinElectionTimeoutMillis) * time.Millisecond
 }
 
 // Given the index of a log entry, get that entry (copy). Fail-fast is used for manifesting errors as early as possible
