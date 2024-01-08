@@ -13,8 +13,8 @@ import (
 	"time"
 )
 
-const RaftStateLengthRatio float64 = 0.8  // the threshold above which the raft state length (mainly log) will trigger taking a snapshot
-const SnapshotCheckerSleepMills int = 50  // the period to check if a snapshot should be taken, fast enough to pass the grader
+const RaftStateLengthRatio float64 = 0.8 // the threshold above which the raft state length (mainly log) will trigger taking a snapshot
+// const SnapshotCheckerSleepMills int = 50  // the period to check if a snapshot should be taken, fast enough to pass the grader
 const StaleDetectorSleepMillis int = 1500 // how long to check if the term deviated from the term a command is appended in log
 // set to be very large because the change of term does not necessarily mean that the entry will be erased. It can still
 // be committed and applied by another leader (if that leader has the replication before the term change)
@@ -71,12 +71,13 @@ type Op struct {
 }
 
 type KVServer struct {
-	mu           sync.Mutex
-	me           int
-	rf           *raft.Raft
-	applyCh      chan raft.ApplyMsg
-	dead         int32 // set by Kill()
-	maxRaftState int   // snapshot if log grows this big
+	mu                sync.Mutex
+	me                int
+	rf                *raft.Raft
+	applyCh           chan raft.ApplyMsg
+	dead              int32 // set by Kill()
+	maxRaftState      int   // snapshot if log grows this big
+	snapshotThreshold int   // calculated based on maxRaftState
 	// why map of conditional variables instead of one coarse conditional variable?
 	// If using a coarse conditional variable, hard to pass idiosyncratic message for each RPC handlers.
 	// (still need a map to pass the message)
@@ -211,8 +212,14 @@ func (kv *KVServer) applyChannelObserver() {
 				}
 				kv.lastExecutedIndex = applyMsg.CommandIndex
 			}
+			// take snapshot if the new command makes the raft state too long
+			if kv.shouldTakeSnapshot() {
+				snapshot := kv.serializeSnapshot() // with lock, obstructing normal execution
+				kv.logService(false, "Service decide to take snapshot under the threshold %d!", kv.snapshotThreshold)
+				kv.rf.Snapshot(kv.lastExecutedIndex, snapshot)
+			}
 			rpcContext, ok := kv.rpcContexts[applyMsg.CommandIndex]
-			// reply if there is a matched RPC handler
+			// reply if there is a matched RPC handler (i.e. the leader that talked to the client is the current server)
 			if ok {
 				rpcContext.deliverResponseAndNotify(response)
 				kv.logRPC(false, response.ClerkId, response.SeqNum, "Notify the RPC handler with the reply message!")
@@ -332,23 +339,14 @@ func (kv *KVServer) staleRpcContextDetector() {
 	}
 }
 
-// periodically determine if it should take a snapshot by check if state size is too large
-func (kv *KVServer) snapshotTaker() {
-	kv.logService(false, "Start the snapshot taker that periodically query if the raft state is too long...")
-	// never open up the observer to take snapshot if -1
+// after each time the stateMachine executed a new command, check if the size of the log has grown too large and
+// take snapshot if so.
+func (kv *KVServer) shouldTakeSnapshot() bool {
+	// according to protocol, -1 represents never to take snapshot
 	if kv.maxRaftState == -1 {
-		return
+		return false
 	}
-	for !kv.killed() {
-		time.Sleep(time.Duration(SnapshotCheckerSleepMills) * time.Millisecond)
-		kv.mu.Lock()
-		threshold := int(RaftStateLengthRatio * float64(kv.maxRaftState))
-		if kv.rf.IsStateSizeAbove(threshold) {
-			snapshot := kv.serializeSnapshot()
-			kv.rf.Snapshot(kv.lastExecutedIndex, snapshot)
-		}
-		kv.mu.Unlock()
-	}
+	return kv.rf.IsStateSizeAbove(kv.snapshotThreshold)
 }
 
 // serialize the state machine and duplicate table
@@ -420,6 +418,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		duplicateTable:    make(map[int64]*CommandResponse),
 		rpcContexts:       make(map[int]*RpcContext),
 		lastExecutedIndex: 0,
+		snapshotThreshold: int(RaftStateLengthRatio * float64(maxraftstate)),
 	}
 	// You may need initialization code here.
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -430,7 +429,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	go kv.applyChannelObserver()
 	go kv.staleRpcContextDetector()
-	go kv.snapshotTaker()
 	return kv
 }
 

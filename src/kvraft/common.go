@@ -7,7 +7,7 @@ import (
 )
 
 // used to control whether or not print debugging info
-const KVDebug = true
+const KVDebug = false
 const (
 	OK                    = "OK"                    // applied
 	ErrNoKey              = "ErrNoKey"              // for GET, applied but no key
