@@ -180,6 +180,11 @@ func (rf *Raft) IsStateSizeAbove(threshold int) bool {
 	return rf.persister.RaftStateSize() >= threshold
 }
 
+// api for the service to read snapshot from disk
+func (rf *Raft) ReadSnapshot() []byte {
+	return rf.persister.ReadSnapshot()
+}
+
 // restore previously persisted Raft state. Used only when the server restarts (from crash) along with read snapshot
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state
@@ -283,7 +288,6 @@ type RequestVoteArgs struct {
 
 // RequestVote RPC reply structure.
 type RequestVoteReply struct {
-	// Your Data here (2A).
 	Term         int
 	VotedGranted bool
 }
@@ -431,7 +435,6 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 
 // RequestVote RPC handler.
 func (rf *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	rf.logProducer(args.CandidateId,
 		"Received RequestVote in candidate term %d",
