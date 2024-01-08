@@ -55,7 +55,7 @@ Also, substantial comments are supplied in my code to explain how different scen
 ## Skills and Concepts Acquired
 
 - Comprehensive understanding of distributed systems principles and their practical applications.
-- Mastery in consensus, fault tolerance, sharding, and state management within Raft.
+- Mastery in how strong consensus, fault tolerance, performance are achieved and traded off with each other in Raft.
 - Hands-on experience in designing scalable systems akin to industry-standard distributed systems.
 - Development expertise in Go, especially for programming in concurrency.
 
