@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"fmt"
 	"log"
 	"strconv"
@@ -12,7 +13,9 @@ import (
 	"time"
 )
 
-const DetectorSleepMillis int = 2000 // how long to check if the term deviated from the term a command is appended in log
+const RaftStateLengthRatio float64 = 0.8 // the threshold above which the raft state length (mainly log) will trigger taking a snapshot
+// const SnapshotCheckerSleepMills int = 50  // the period to check if a snapshot should be taken, fast enough to pass the grader
+const StaleDetectorSleepMillis int = 1500 // how long to check if the term deviated from the term a command is appended in log
 // set to be very large because the change of term does not necessarily mean that the entry will be erased. It can still
 // be committed and applied by another leader (if that leader has the replication before the term change)
 // If such detection occurs after the term changed but before the command is appended in the log, it has the risk that
@@ -68,12 +71,13 @@ type Op struct {
 }
 
 type KVServer struct {
-	mu           sync.Mutex
-	me           int
-	rf           *raft.Raft
-	applyCh      chan raft.ApplyMsg
-	dead         int32 // set by Kill()
-	maxRaftState int   // snapshot if log grows this big
+	mu                sync.Mutex
+	me                int
+	rf                *raft.Raft
+	applyCh           chan raft.ApplyMsg
+	dead              int32 // set by Kill()
+	maxRaftState      int   // snapshot if log grows this big
+	snapshotThreshold int   // calculated based on maxRaftState
 	// why map of conditional variables instead of one coarse conditional variable?
 	// If using a coarse conditional variable, hard to pass idiosyncratic message for each RPC handlers.
 	// (still need a map to pass the message)
@@ -85,6 +89,7 @@ type KVServer struct {
 
 	stateMachine   map[string]string          // the in-memory key-value stateMachine
 	duplicateTable map[int64]*CommandResponse // used to detect duplicated commands to execute or duplicated client request
+
 }
 
 // The RPC handler for all GET, PUT and APPEND operation
@@ -207,15 +212,29 @@ func (kv *KVServer) applyChannelObserver() {
 				}
 				kv.lastExecutedIndex = applyMsg.CommandIndex
 			}
+			// take snapshot if the new command makes the raft state too long
+			if kv.shouldTakeSnapshot() {
+				snapshot := kv.serializeSnapshot() // with lock, obstructing normal execution
+				kv.logService(false, "Service decide to take snapshot under the threshold %d!", kv.snapshotThreshold)
+				kv.rf.Snapshot(kv.lastExecutedIndex, snapshot)
+			}
 			rpcContext, ok := kv.rpcContexts[applyMsg.CommandIndex]
-			// reply if there is a matched RPC handler
+			// reply if there is a matched RPC handler (i.e. the leader that talked to the client is the current server)
 			if ok {
 				rpcContext.deliverResponseAndNotify(response)
 				kv.logRPC(false, response.ClerkId, response.SeqNum, "Notify the RPC handler with the reply message!")
 			}
 			kv.mu.Unlock()
 		} else if applyMsg.SnapshotValid {
-			// (3B)
+			// The raft has arranged that the snapshot will be uploaded to the service only if it is more up to date
+			if kv.lastExecutedIndex >= applyMsg.SnapshotIndex {
+				kv.logService(true, "ERROR: Received from Raft a snapshot that is not more up-to-date than the current state machine")
+			}
+			kv.logService(false, "Received from Raft an entire up-to-date snapshot!")
+			kv.deserializeSnapshot(applyMsg.Snapshot)
+			if applyMsg.SnapshotIndex != kv.lastExecutedIndex {
+				kv.logService(true, "ERROR: Index deserialized from snapshot not equal to the index in the apply message!")
+			}
 			kv.mu.Unlock()
 		} else {
 			kv.logService(true, "ERROR: Neither snapshot nor command for a applyMsg!")
@@ -298,8 +317,9 @@ func (kv *KVServer) apply(operation *Op) *CommandResponse {
 // Note that for safety, the command is still likely to be committed, which might be unsafe. But in the synchronous
 // setting, the client will always retry. Therefore, there is no safety issue in this particular scenario.
 func (kv *KVServer) staleRpcContextDetector() {
+	kv.logService(false, "Start the detector for pending client requests whose log entry is outdated in term...")
 	for !kv.killed() {
-		time.Sleep(time.Duration(DetectorSleepMillis) * time.Millisecond)
+		time.Sleep(time.Duration(StaleDetectorSleepMillis) * time.Millisecond)
 		kv.mu.Lock()
 		currentTerm, isLeader := kv.rf.GetState()
 		kv.logService(false, "Current Term %d; Is server %d leader? "+strconv.FormatBool(isLeader), currentTerm, kv.me)
@@ -319,6 +339,58 @@ func (kv *KVServer) staleRpcContextDetector() {
 	}
 }
 
+// after each time the stateMachine executed a new command, check if the size of the log has grown too large and
+// take snapshot if so.
+func (kv *KVServer) shouldTakeSnapshot() bool {
+	// according to protocol, -1 represents never to take snapshot
+	if kv.maxRaftState == -1 {
+		return false
+	}
+	return kv.rf.IsStateSizeAbove(kv.snapshotThreshold)
+}
+
+// serialize the state machine and duplicate table
+func (kv *KVServer) serializeSnapshot() []byte {
+	kv.logService(false, "Serialize the service states into a snapshot!")
+	writeBuffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writeBuffer)
+	if encoder.Encode(kv.stateMachine) != nil {
+		kv.logService(true, "Fail to encode the state machine!")
+	}
+	if encoder.Encode(kv.duplicateTable) != nil {
+		kv.logService(true, "Fail to encode duplicate table!")
+	}
+	if encoder.Encode(kv.lastExecutedIndex) != nil {
+		kv.logService(true, "Fail to encode the last executed index!")
+	}
+	return writeBuffer.Bytes()
+}
+
+// deserialize the snapshot and write the field into the kv server
+func (kv *KVServer) deserializeSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state
+		return
+	}
+	kv.logService(false, "Deserialize the snapshot into service states!")
+	readBuffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(readBuffer)
+	var stateMachine map[string]string
+	var duplicateTable map[int64]*CommandResponse
+	var lastExecutedIndex int
+	if decoder.Decode(&stateMachine) != nil {
+		kv.logService(false, "Failed to read state machine from snapshot bytes!")
+	}
+	if decoder.Decode(&duplicateTable) != nil {
+		kv.logService(false, "Failed to read duplicate table from snapshot bytes!")
+	}
+	if decoder.Decode(&lastExecutedIndex) != nil {
+		kv.logService(false, "Failed to read last executed index from snapshot bytes!")
+	}
+	kv.stateMachine = stateMachine
+	kv.duplicateTable = duplicateTable
+	kv.lastExecutedIndex = lastExecutedIndex
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -334,21 +406,26 @@ func (kv *KVServer) staleRpcContextDetector() {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(Op{})              // as the command stored in logs
+	labgob.Register(CommandResponse{}) // as the response cached in duplicate table
 
 	kv := &KVServer{
-		me:             me,
-		maxRaftState:   maxraftstate,
-		applyCh:        make(chan raft.ApplyMsg),
-		dead:           0,
-		stateMachine:   make(map[string]string),
-		duplicateTable: make(map[int64]*CommandResponse),
-		rpcContexts:    make(map[int]*RpcContext),
+		me:                me,
+		maxRaftState:      maxraftstate,
+		applyCh:           make(chan raft.ApplyMsg),
+		dead:              0,
+		stateMachine:      make(map[string]string),
+		duplicateTable:    make(map[int64]*CommandResponse),
+		rpcContexts:       make(map[int]*RpcContext),
+		lastExecutedIndex: 0,
+		snapshotThreshold: int(RaftStateLengthRatio * float64(maxraftstate)),
 	}
 	// You may need initialization code here.
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	// (3B: load from persister)
+	kv.logService(false, "Restart (or start) the service...")
 
+	// load states from persisted snapshot
+	kv.deserializeSnapshot(kv.rf.ReadSnapshot())
 	// You may need initialization code here.
 	go kv.applyChannelObserver()
 	go kv.staleRpcContextDetector()
@@ -358,7 +435,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 // logging functions
 // 1. logging info regarding the service itself
 func (kv *KVServer) logService(fatal bool, format string, args ...interface{}) {
-	if Debug {
+	if KVDebug {
 		prefix := fmt.Sprintf("Service-%d: ", kv.me)
 		if fatal {
 			log.Fatalf(prefix+format+"\n", args...)
@@ -370,7 +447,7 @@ func (kv *KVServer) logService(fatal bool, format string, args ...interface{}) {
 
 // 2. logging info regarding the communication between clerk and service
 func (kv *KVServer) logRPC(fatal bool, clerkId int64, seqNum int, format string, args ...interface{}) {
-	if Debug {
+	if KVDebug {
 		// convert id to base64 and take a prefix for logging purpose
 		clerkStr := base64Prefix(clerkId)
 		prefixService := fmt.Sprintf("Service-%d ", kv.me)

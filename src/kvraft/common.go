@@ -7,7 +7,7 @@ import (
 )
 
 // used to control whether or not print debugging info
-const Debug = true
+const KVDebug = false
 const (
 	OK                    = "OK"                    // applied
 	ErrNoKey              = "ErrNoKey"              // for GET, applied but no key
@@ -16,6 +16,8 @@ const (
 	ErrLogEntryErased     = "ErrLogEntryErased"     // previous index is detected with a new log entry, definitely not applied
 	ErrTermChanged        = "ErrTermChanged"        // Periodic term detector found that the term of the previous leader has changed, no guarantee if the command will be applied or erased.
 )
+
+// used to shorten the uid of a client for logging
 const PrefixLength = 5
 
 type OperationType int

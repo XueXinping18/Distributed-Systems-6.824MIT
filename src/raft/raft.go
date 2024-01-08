@@ -74,10 +74,10 @@ func (identity ServerIdentity) String() string {
 }
 
 const (
-	MIN_ELECTION_TIMEOUT_MILLIS  int64 = 500
-	MAX_ELECTION_TIMEOUT_MILLIS  int64 = 1000
-	APPEND_ENTRIES_PERIOD_MILLIS int64 = 100
-	TICKER_PERIOD_MILLIS         int64 = 30
+	MinElectionTimeoutMillis  int64 = 500
+	MaxElectionTimeoutMillis  int64 = 1000
+	AppendEntriesPeriodMillis int64 = 100
+	TickerPeriodMillis        int64 = 30
 )
 
 // A Go object implementing a single Raft peer.
@@ -136,50 +136,15 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
-	// Your code here (2C).
 	rf.logServer("Save the server states to stable storage!")
-	writeBuffer := new(bytes.Buffer)
-	e := labgob.NewEncoder(writeBuffer)
-	if e.Encode(rf.currentTerm) != nil {
-		rf.logServer("Failed to encode current term!")
-	}
-	if e.Encode(rf.votedFor) != nil {
-		rf.logServer("Failed to encode who the server voted for!")
-	}
-	if e.Encode(rf.log) != nil {
-		rf.logServer("Failed to encode log!")
-	}
-	if e.Encode(rf.snapshotLastIndex) != nil {
-		rf.logServer("Failed to encode the last term in snapshot!")
-	}
-	if e.Encode(rf.snapshotLastTerm) != nil {
-		rf.logServer("Failed to encode the last index in snapshot!")
-	}
-	data := writeBuffer.Bytes()
+	data := rf.serializeRaftState()
 	rf.persister.SaveRaftState(data)
 }
 
 // used when both snapshot and states changed
 func (rf *Raft) persistWithSnapshot() {
 	rf.logServer("Save the server states to stable storage!")
-	writeBuffer := new(bytes.Buffer)
-	e := labgob.NewEncoder(writeBuffer)
-	if e.Encode(rf.currentTerm) != nil {
-		rf.logServer("Failed to encode current term!")
-	}
-	if e.Encode(rf.votedFor) != nil {
-		rf.logServer("Failed to encode who the server voted for!")
-	}
-	if e.Encode(rf.log) != nil {
-		rf.logServer("Failed to encode log!")
-	}
-	if e.Encode(rf.snapshotLastIndex) != nil {
-		rf.logServer("Failed to encode the last term in snapshot!")
-	}
-	if e.Encode(rf.snapshotLastTerm) != nil {
-		rf.logServer("Failed to encode the last index in snapshot!")
-	}
-	data := writeBuffer.Bytes()
+	data := rf.serializeRaftState()
 	// according to protocol, empty snapshot should be saved as nil
 	if len(rf.snapshot) == 0 {
 		rf.snapshot = nil
@@ -188,36 +153,66 @@ func (rf *Raft) persistWithSnapshot() {
 	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
 }
 
+// define what fields to marshall
+func (rf *Raft) serializeRaftState() []byte {
+	writeBuffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writeBuffer)
+	if encoder.Encode(rf.currentTerm) != nil {
+		rf.logServer("Failed to encode current term!")
+	}
+	if encoder.Encode(rf.votedFor) != nil {
+		rf.logServer("Failed to encode who the server voted for!")
+	}
+	if encoder.Encode(rf.log) != nil {
+		rf.logServer("Failed to encode log!")
+	}
+	if encoder.Encode(rf.snapshotLastIndex) != nil {
+		rf.logServer("Failed to encode the last term in snapshot!")
+	}
+	if encoder.Encode(rf.snapshotLastTerm) != nil {
+		rf.logServer("Failed to encode the last index in snapshot!")
+	}
+	return writeBuffer.Bytes()
+}
+
+// api for the service to query if state size too large
+func (rf *Raft) IsStateSizeAbove(threshold int) bool {
+	return rf.persister.RaftStateSize() >= threshold
+}
+
+// api for the service to read snapshot from disk
+func (rf *Raft) ReadSnapshot() []byte {
+	return rf.persister.ReadSnapshot()
+}
+
 // restore previously persisted Raft state. Used only when the server restarts (from crash) along with read snapshot
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 { // bootstrap without any state
 		return
 	}
 	rf.logServer("Read from stable storage states of the server!")
 	readBuffer := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(readBuffer)
+	decoder := labgob.NewDecoder(readBuffer)
 	var currentTerm int
 	var votedFor int
 	var newLog []LogEntry
 	var snapshotLastIndex int
 	var snapshotLastTerm int
-	if d.Decode(&currentTerm) != nil {
+	if decoder.Decode(&currentTerm) != nil {
 		rf.logServer("Failed to read current term from persistent states!")
 	}
-	if d.Decode(&votedFor) != nil {
+	if decoder.Decode(&votedFor) != nil {
 		rf.logServer("Failed to read who the server voted for from persistent states!")
 	}
-	if d.Decode(&newLog) != nil {
+	if decoder.Decode(&newLog) != nil {
 		rf.logServer("Failed to read log from persistent states!")
 	}
-	if d.Decode(&snapshotLastIndex) != nil {
+	if decoder.Decode(&snapshotLastIndex) != nil {
 		rf.logServer("Failed to read the last index in snapshot from persistent states!")
 	}
-	if d.Decode(&snapshotLastTerm) != nil {
+	if decoder.Decode(&snapshotLastTerm) != nil {
 		rf.logServer("Failed to read the last term in snapshot from persistent states!")
 	}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = newLog
@@ -226,9 +221,14 @@ func (rf *Raft) readPersist(data []byte) {
 
 	// restore volatile states according to persistent states
 	rf.commitIndex = max(rf.commitIndex, rf.snapshotLastIndex)
-	// we do not restore rf.lastApplied because it is likely that the snapshot is not applied but persisted
+	// Should LastApplied be restored?
+	// I previously believe I should not restore rf.lastApplied because it is likely that the snapshot is not applied but persisted
 	// In the case where the snapshot is installed from a peer (installSnapshot) and persisted successfully but not applied
 	// to the state machine before the server crash.
+	// however, if the server crashed in between, after the restart the service will also recover from the snapshot,
+	// which will update the lastExecutedIndex field of the service to the snapshotLastIndex.
+	// Therefore, lastApplied should be restored.
+	rf.lastApplied = max(rf.lastApplied, rf.snapshotLastIndex)
 
 	// Idempotence of the operations guaranteed the correctness when duplicated applies happened after crash.
 }
@@ -246,7 +246,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // service no longer needs the log through (and including)
 // that Index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.logServer("Service called Snapshot...")
@@ -291,7 +290,6 @@ type RequestVoteArgs struct {
 
 // RequestVote RPC reply structure.
 type RequestVoteReply struct {
-	// Your Data here (2A).
 	Term         int
 	VotedGranted bool
 }
@@ -422,7 +420,7 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		}
 	}
 	rf.logProducer(args.LeaderId, "Accept AppendEntries!")
-	// persist if log modified
+	// persist if log modified, must happen before apply to the service (write-ahead logging)
 	if logModified {
 		rf.persist()
 	}
@@ -439,7 +437,6 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 
 // RequestVote RPC handler.
 func (rf *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	rf.logProducer(args.CandidateId,
 		"Received RequestVote in candidate term %d",
@@ -495,15 +492,16 @@ func (rf *Raft) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *InstallS
 	rf.replaceSnapshotAndUpdate(args.Data, args.LastIncludedIndex, args.LastIncludedTerm)
 	// update commitIndex, only deliver snapshot to service when commitIndex increased!
 	// Otherwise, the service might have more up-to-date snapshot
+
+	// must persist before delivery to service. Never give the opportunity of service replied to client without persist the state
+	rf.persistWithSnapshot()
 	if rf.commitIndex < rf.snapshotLastIndex {
 		prev := rf.commitIndex
 		rf.commitIndex = rf.snapshotLastIndex
 		// notify the increase of commitIndex
 		rf.commitCond.Broadcast()
 		rf.logProducer(args.LeaderId, "Accept of InstallSnapshot increases the commitIndex from %d to %d", prev, rf.commitIndex)
-
 	}
-	rf.persistWithSnapshot()
 	rf.logProducer(args.LeaderId, "Finished the handling of InstallSnapshot request")
 }
 
@@ -717,7 +715,7 @@ func (rf *Raft) ticker() {
 			rf.runForCandidate()
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(TICKER_PERIOD_MILLIS) * time.Millisecond)
+		time.Sleep(time.Duration(TickerPeriodMillis) * time.Millisecond)
 	}
 }
 
@@ -729,7 +727,7 @@ func (rf *Raft) commitObserver() {
 	go func() {
 		rf.logServer("The timer to send notifications for applying command started!")
 		for !rf.killed() {
-			time.Sleep(time.Duration(TICKER_PERIOD_MILLIS) * time.Millisecond)
+			time.Sleep(time.Duration(TickerPeriodMillis) * time.Millisecond)
 			// wrapped in lock to reduce the number of missed notifications
 			rf.mu.Lock()
 			rf.commitCond.Broadcast()
@@ -792,7 +790,7 @@ func (rf *Raft) broadcastAppendEntries(isHeartbeat bool) {
 
 	// must update the next broadcast time if it is heartbeat
 	if isHeartbeat {
-		rf.nextHeartbeatTime = time.Now().Add(time.Duration(APPEND_ENTRIES_PERIOD_MILLIS) * time.Millisecond)
+		rf.nextHeartbeatTime = time.Now().Add(time.Duration(AppendEntriesPeriodMillis) * time.Millisecond)
 	}
 
 	rf.logServer("BroadCast AppendEntries Messages...")
@@ -1132,8 +1130,8 @@ func (rf *Raft) logConsumer(producerId int, format string, args ...interface{}) 
 	log.Printf(message, args...)
 }
 func generateRandomTimeout() time.Duration {
-	return time.Duration(rand.Int63n(MAX_ELECTION_TIMEOUT_MILLIS-MIN_ELECTION_TIMEOUT_MILLIS)+
-		MIN_ELECTION_TIMEOUT_MILLIS) * time.Millisecond
+	return time.Duration(rand.Int63n(MaxElectionTimeoutMillis-MinElectionTimeoutMillis)+
+		MinElectionTimeoutMillis) * time.Millisecond
 }
 
 // Given the index of a log entry, get that entry (copy). Fail-fast is used for manifesting errors as early as possible

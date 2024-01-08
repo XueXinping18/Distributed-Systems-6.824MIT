@@ -18,6 +18,7 @@ type Clerk struct {
 	nextSeqNum      int32 // atomically increase for SeqNum
 }
 
+// generate random int64
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -148,7 +149,7 @@ func (ck *Clerk) Operation(args *OperationArgs) string {
 }
 
 func (ck *Clerk) logClerk(fatal bool, format string, args ...interface{}) {
-	if !Debug {
+	if !KVDebug {
 		return
 	}
 	prefix := "Clerk-" + ck.base64IdPrefix + ": "
@@ -160,7 +161,7 @@ func (ck *Clerk) logClerk(fatal bool, format string, args ...interface{}) {
 	}
 }
 func (ck *Clerk) logRPC(fatal bool, seqNum int, serverId int, format string, args ...interface{}) {
-	if !Debug {
+	if !KVDebug {
 		return
 	}
 	prefixClerk := "Clerk-" + ck.base64IdPrefix + " "
