@@ -148,7 +148,7 @@ func (ck *Clerk) Operation(args *OperationArgs) string {
 }
 
 func (ck *Clerk) logClerk(fatal bool, format string, args ...interface{}) {
-	if !Debug {
+	if !KVDebug {
 		return
 	}
 	prefix := "Clerk-" + ck.base64IdPrefix + ": "
@@ -160,7 +160,7 @@ func (ck *Clerk) logClerk(fatal bool, format string, args ...interface{}) {
 	}
 }
 func (ck *Clerk) logRPC(fatal bool, seqNum int, serverId int, format string, args ...interface{}) {
-	if !Debug {
+	if !KVDebug {
 		return
 	}
 	prefixClerk := "Clerk-" + ck.base64IdPrefix + " "

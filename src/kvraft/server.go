@@ -13,8 +13,9 @@ import (
 	"time"
 )
 
-const SnapshotCheckerSleepMills int = 500
-const StaleDetectorSleepMillis int = 2000 // how long to check if the term deviated from the term a command is appended in log
+const RaftStateLengthRatio float64 = 0.8  // the threshold above which the raft state length (mainly log) will trigger taking a snapshot
+const SnapshotCheckerSleepMills int = 50  // the period to check if a snapshot should be taken, fast enough to pass the grader
+const StaleDetectorSleepMillis int = 1500 // how long to check if the term deviated from the term a command is appended in log
 // set to be very large because the change of term does not necessarily mean that the entry will be erased. It can still
 // be committed and applied by another leader (if that leader has the replication before the term change)
 // If such detection occurs after the term changed but before the command is appended in the log, it has the risk that
@@ -341,8 +342,7 @@ func (kv *KVServer) snapshotTaker() {
 	for !kv.killed() {
 		time.Sleep(time.Duration(SnapshotCheckerSleepMills) * time.Millisecond)
 		kv.mu.Lock()
-		threshold := kv.maxRaftState
-		// threshold := int(math.Round(0.8 * float64(kv.maxRaftState)))
+		threshold := int(RaftStateLengthRatio * float64(kv.maxRaftState))
 		if kv.rf.IsStateSizeAbove(threshold) {
 			snapshot := kv.serializeSnapshot()
 			kv.rf.Snapshot(kv.lastExecutedIndex, snapshot)
@@ -359,7 +359,6 @@ func (kv *KVServer) serializeSnapshot() []byte {
 	if encoder.Encode(kv.stateMachine) != nil {
 		kv.logService(true, "Fail to encode the state machine!")
 	}
-	// TODO: serialize a map of objects instead of pointers
 	if encoder.Encode(kv.duplicateTable) != nil {
 		kv.logService(true, "Fail to encode duplicate table!")
 	}
@@ -438,7 +437,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 // logging functions
 // 1. logging info regarding the service itself
 func (kv *KVServer) logService(fatal bool, format string, args ...interface{}) {
-	if Debug {
+	if KVDebug {
 		prefix := fmt.Sprintf("Service-%d: ", kv.me)
 		if fatal {
 			log.Fatalf(prefix+format+"\n", args...)
@@ -450,7 +449,7 @@ func (kv *KVServer) logService(fatal bool, format string, args ...interface{}) {
 
 // 2. logging info regarding the communication between clerk and service
 func (kv *KVServer) logRPC(fatal bool, clerkId int64, seqNum int, format string, args ...interface{}) {
-	if Debug {
+	if KVDebug {
 		// convert id to base64 and take a prefix for logging purpose
 		clerkStr := base64Prefix(clerkId)
 		prefixService := fmt.Sprintf("Service-%d ", kv.me)
