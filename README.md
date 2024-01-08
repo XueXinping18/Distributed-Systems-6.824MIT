@@ -7,12 +7,12 @@ This repository contains my solutions for the MIT 6.824 Distributed Systems cour
 
 ## Labs Overview
 
-### Lab 1: MapReduce
+### Lab 1: MapReduce (finished)
 - **Description:** Implementing the MapReduce programming model for parallel data processing.
 - **Key Concepts:** Parallel computing, large-scale data processing.
 - **Similar Industry Middleware:** Hadoop MapReduce, Apache Spark.
 
-### Lab 2: Raft Consensus Algorithm
+### Lab 2: Raft Consensus Algorithm (finished)
 - **Subsections:**
   - **Lab 2A: Raft Leader Election**
     - Implementing leader election within the Raft consensus framework.
@@ -24,7 +24,7 @@ This repository contains my solutions for the MIT 6.824 Distributed Systems cour
     - Implementing log compaction in Raft to handle growing log sizes and reduce time to recover states on restarts.
 - **Similar Industry Middleware:** Apache ZooKeeper, etcd.
 
-### Lab 3: Fault-tolerant Key/Value Service
+### Lab 3: Fault-tolerant Key/Value Service (finished)
 - **Subsections:**
   - **Lab 3A: Key/Value Service Without Snapshots**
     - Building a key/value store on Raft to achieve strong consistency among replicated state machines, featured with mechanisms for duplication detection and handling of stale requests.
@@ -32,7 +32,7 @@ This repository contains my solutions for the MIT 6.824 Distributed Systems cour
     - Enhancing the key/value store with snapshot functionality for efficient state management.
 - **Similar Industry Middleware:** Redis, Amazon DynamoDB.
 
-### Lab 4: Sharded Key/Value Service
+### Lab 4: Sharded Key/Value Service (ongoing)
 - **Subsections:**
   - **Part A: The Shard Controller**
     - Developing a shard controller to manage configurations and shard assignments among replica groups.
