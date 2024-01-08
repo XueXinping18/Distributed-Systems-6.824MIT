@@ -18,6 +18,7 @@ type Clerk struct {
 	nextSeqNum      int32 // atomically increase for SeqNum
 }
 
+// generate random int64
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
