@@ -185,7 +185,6 @@ func (kv *KVServer) HandleOperation(args *OperationArgs, reply *OperationReply) 
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
