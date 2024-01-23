@@ -52,7 +52,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-	args := &OperationArgs{
+	args := &KVOperationArgs{
 		Key:     key,
 		Value:   "",
 		Type:    GET,
@@ -60,10 +60,10 @@ func (ck *Clerk) Get(key string) string {
 		SeqNum:  int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
 	ck.logClerk(false, "Client issues GET operation with key "+key+".")
-	return ck.Operation(args)
+	return ck.KVOperation(args)
 }
 func (ck *Clerk) Put(key string, value string) {
-	args := &OperationArgs{
+	args := &KVOperationArgs{
 		Key:     key,
 		Value:   value,
 		Type:    PUT,
@@ -71,10 +71,10 @@ func (ck *Clerk) Put(key string, value string) {
 		SeqNum:  int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
 	ck.logClerk(false, "Client issues PUT operation with key "+key+" and value "+value+".")
-	ck.Operation(args)
+	ck.KVOperation(args)
 }
 func (ck *Clerk) Append(key string, value string) {
-	args := &OperationArgs{
+	args := &KVOperationArgs{
 		Key:     key,
 		Value:   value,
 		Type:    APPEND,
@@ -82,22 +82,22 @@ func (ck *Clerk) Append(key string, value string) {
 		SeqNum:  int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
 	ck.logClerk(false, "Client issues APPEND operation with key "+key+" and value "+value+".")
-	ck.Operation(args)
+	ck.KVOperation(args)
 }
 
-// Handling the RPC for the operation given the OperationArgs
+// Handling the RPC for the operation given the KVOperationArgs
 // return the result string if it is a Get, return empty string if not
 // the function won't return until the successful finish of the operation
 // Note that the client will issue requests one at a time, there is no burden on handling concurrency on client side!
-func (ck *Clerk) Operation(args *OperationArgs) string {
-	var reply *OperationReply
+func (ck *Clerk) KVOperation(args *KVOperationArgs) string {
+	var reply *KVOperationReply
 	seqNum := args.SeqNum
 	count := 0
 	for done := false; !done; {
 		ck.logClerk(false, "The number of attempt to send the operation for the SeqNum %d is %d. Do the next attempt!",
 			seqNum, count)
 		// reset reply struct for every retry
-		reply = new(OperationReply)
+		reply = new(KVOperationReply)
 		var serverId int
 		// decide which leader to choose
 		if ck.preferredServer == -1 {
@@ -109,7 +109,7 @@ func (ck *Clerk) Operation(args *OperationArgs) string {
 		}
 		// Doing RPC to the server.
 		// Note that serverId in client side and server side is different for the same server
-		ok := ck.servers[serverId].Call("KVServer.HandleOperation", args, reply)
+		ok := ck.servers[serverId].Call("KVServer.HandleKVOperation", args, reply)
 
 		// handle the RPC reply and potentially retry, update the preferred server to send
 		if !ok {

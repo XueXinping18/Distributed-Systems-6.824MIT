@@ -23,10 +23,10 @@ const StaleDetectorSleepMillis int = 1500 // how long to check if the term devia
 // which is still safe because the clerk is guaranteed to retry the command until it succeeded, but it still incurs
 // much larger overhead.
 
-// CommandResponse is used to cache the result of the most recent command from a specific clerk
+// KVCommandResponse is used to cache the result of the most recent command from a specific clerk
 // Because the design is synchronous, duplication with uncertainty only happens for the most recent command
 // (i.e. the client always retry the previous unsuccessful command before it issues the new command)
-type CommandResponse struct {
+type KVCommandResponse struct {
 	ClerkId int64
 	SeqNum  int
 	Err     Err
@@ -37,9 +37,9 @@ type CommandResponse struct {
 type RpcContext struct {
 	ClerkId      int64
 	SeqNum       int
-	TermAppended int              // record the term that the log is appended, invalidate the request if the change of term detected
-	replyCond    *sync.Cond       // used to wake up the waiting RPC handler after response is assembled
-	Response     *CommandResponse // used by the sender thread to send the response to the receiver handler
+	TermAppended int                // record the term that the log is appended, invalidate the request if the change of term detected
+	replyCond    *sync.Cond         // used to wake up the waiting RPC handler after response is assembled
+	Response     *KVCommandResponse // used by the sender thread to send the response to the receiver handler
 }
 
 // The constructor for RpcContext, mainly for bind the conditional variable to the mutex of the KVServer
@@ -52,20 +52,16 @@ func (kv *KVServer) NewRpcContext(clerkId int64, seqNum int, term int) *RpcConte
 		Response:     nil,
 	}
 }
-func (rpcContext *RpcContext) deliverResponseAndNotify(response *CommandResponse) {
+func (rpcContext *RpcContext) deliverResponseAndNotify(response *KVCommandResponse) {
 	rpcContext.Response = response
 	rpcContext.replyCond.Broadcast()
 }
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-
 	// ClerkId and SeqNum uniquely identify the operation
 	ClerkId int64
 	SeqNum  int
-	Type    OperationType
+	Type    KVOperationType
 	Key     string
 	Value   string // not used if the type is GET
 }
@@ -87,13 +83,13 @@ type KVServer struct {
 	rpcContexts       map[int]*RpcContext // for each RPC there will be a rpcContext for it to pass in response and notify the finish of response
 	lastExecutedIndex int
 
-	stateMachine   map[string]string          // the in-memory key-value stateMachine
-	duplicateTable map[int64]*CommandResponse // used to detect duplicated commands to execute or duplicated client request
+	stateMachine   map[string]string            // the in-memory key-value stateMachine
+	duplicateTable map[int64]*KVCommandResponse // used to detect duplicated commands to execute or duplicated client request
 
 }
 
 // The RPC handler for all GET, PUT and APPEND operation
-func (kv *KVServer) HandleOperation(args *OperationArgs, reply *OperationReply) {
+func (kv *KVServer) HandleKVOperation(args *KVOperationArgs, reply *KVOperationReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	cache, ok := kv.duplicateTable[args.ClerkId]
@@ -141,7 +137,7 @@ func (kv *KVServer) HandleOperation(args *OperationArgs, reply *OperationReply) 
 		// (which implies a different term), we can still suggest the handler to resend because next time it is
 		// most likely to be detected by duplicateTable (either during initial check or check before execution)
 		kv.logRPC(false, args.ClerkId, args.SeqNum, "There is already an RpcContext at the index where the command can reside")
-		response := &CommandResponse{
+		response := &KVCommandResponse{
 			ClerkId: prevContext.ClerkId,
 			SeqNum:  prevContext.SeqNum,
 			Err:     ErrLogEntryErased,
@@ -245,13 +241,13 @@ func (kv *KVServer) applyChannelObserver() {
 // update the replyEntry accordingly
 // if the seqNum is smaller than the cached seqNum for the clerk, the clerk must have received the reply because
 // all operations are synchronous in Raft, so we can safely do nothing
-func (kv *KVServer) validateAndApply(operation *Op) *CommandResponse {
+func (kv *KVServer) validateAndApply(operation *Op) *KVCommandResponse {
 	if operation == nil {
 		kv.logService(true, "ERROR: The operation to execute is a nil pointer!")
 	}
 	cachedEntry, ok := kv.duplicateTable[operation.ClerkId]
 	// not outdated or duplicated
-	var response *CommandResponse
+	var response *KVCommandResponse
 	if !ok || cachedEntry.SeqNum < operation.SeqNum {
 		response = kv.apply(operation)
 		// store the result (especially GET) to duplicateTable
@@ -266,7 +262,7 @@ func (kv *KVServer) validateAndApply(operation *Op) *CommandResponse {
 			" is guaranteed to have seen the response! Simply ignored!")
 		// just return an empty response as the client is guaranteed to see the response already
 		// it will be discarded by the clerk anyway
-		response = &CommandResponse{
+		response = &KVCommandResponse{
 			ClerkId: operation.ClerkId,
 			SeqNum:  operation.SeqNum,
 			Err:     ErrOutOfOrderDelivery,
@@ -277,11 +273,11 @@ func (kv *KVServer) validateAndApply(operation *Op) *CommandResponse {
 }
 
 // Apply the operation to the in-memory kv stateMachine and put the result into kv.replyEntry
-func (kv *KVServer) apply(operation *Op) *CommandResponse {
+func (kv *KVServer) apply(operation *Op) *KVCommandResponse {
 	if operation == nil {
 		kv.logService(true, "ERROR: The operation to execute is a nil pointer!")
 	}
-	response := &CommandResponse{
+	response := &KVCommandResponse{
 		ClerkId: operation.ClerkId,
 		SeqNum:  operation.SeqNum,
 	}
@@ -325,7 +321,7 @@ func (kv *KVServer) staleRpcContextDetector() {
 		for _, rpcContext := range kv.rpcContexts {
 			if currentTerm != rpcContext.TermAppended {
 				kv.logRPC(false, rpcContext.ClerkId, rpcContext.SeqNum, "Outdated waiting rpc handler detected!")
-				reply := &CommandResponse{
+				reply := &KVCommandResponse{
 					ClerkId: rpcContext.ClerkId,
 					SeqNum:  rpcContext.SeqNum,
 					Err:     ErrTermChanged,
@@ -374,7 +370,7 @@ func (kv *KVServer) deserializeSnapshot(data []byte) {
 	readBuffer := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(readBuffer)
 	var stateMachine map[string]string
-	var duplicateTable map[int64]*CommandResponse
+	var duplicateTable map[int64]*KVCommandResponse
 	var lastExecutedIndex int
 	if decoder.Decode(&stateMachine) != nil {
 		kv.logService(false, "Failed to read state machine from snapshot bytes!")
@@ -405,8 +401,8 @@ func (kv *KVServer) deserializeSnapshot(data []byte) {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})              // as the command stored in logs
-	labgob.Register(CommandResponse{}) // as the response cached in duplicate table
+	labgob.Register(Op{})                // as the command stored in logs
+	labgob.Register(KVCommandResponse{}) // as the response cached in duplicate table
 
 	kv := &KVServer{
 		me:                me,
@@ -414,7 +410,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		applyCh:           make(chan raft.ApplyMsg),
 		dead:              0,
 		stateMachine:      make(map[string]string),
-		duplicateTable:    make(map[int64]*CommandResponse),
+		duplicateTable:    make(map[int64]*KVCommandResponse),
 		rpcContexts:       make(map[int]*RpcContext),
 		lastExecutedIndex: 0,
 		snapshotThreshold: int(RaftStateLengthRatio * float64(maxraftstate)),
@@ -425,7 +421,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// load states from persisted snapshot
 	kv.deserializeSnapshot(kv.rf.ReadSnapshot())
-	// You may need initialization code here.
+	// run background thread
 	go kv.applyChannelObserver()
 	go kv.staleRpcContextDetector()
 	return kv
