@@ -248,6 +248,7 @@ func (sc *ShardCtrler) apply(operation *Op) *ControllerCommandResponse {
 	}
 	switch operation.Type {
 	case QUERY:
+		// for out-of-boundary index, simply return the latest configuration
 		if operation.ConfigID < 0 || operation.ConfigID >= len(sc.configs) {
 			response.Config = &sc.configs[len(sc.configs)-1]
 		} else {
@@ -256,17 +257,139 @@ func (sc *ShardCtrler) apply(operation *Op) *ControllerCommandResponse {
 		response.Err = OK
 		sc.logRPC(false, operation.ClerkId, operation.SeqNum, "QUERY operation has been executed!")
 	case JOIN:
+		// create a new config out of previous config
+		newConfig := sc.initializeNewConfig()
+		// update server lists for the new groupS
+		for gid, servers := range operation.Servers {
+			newConfig.Groups[gid] = servers
+		}
+		// re-balance
+		sc.rebalance(newConfig)
+		sc.configs = append(sc.configs, *newConfig)
 		response.Err = OK
 		sc.logRPC(false, operation.ClerkId, operation.SeqNum, "JOIN operation has been executed!")
 	case LEAVE:
+		// create a new config out of previous config
+		newConfig := sc.initializeNewConfig()
+		// create a set of group ids to be removed and remove them from gid-servers mappings
+		gid2remove := make(map[int]bool)
+		for _, gid := range operation.GIDs {
+			gid2remove[gid] = true
+			delete(newConfig.Groups, gid)
+		}
+		// set shards as not assigned
+		prevConfig := sc.configs[len(sc.configs)-1]
+		for shardId, gid := range prevConfig.Shards {
+			_, exists := gid2remove[gid]
+			if exists {
+				newConfig.Shards[shardId] = 0 // set as not assigned to any group
+			}
+		}
+		// re-balance the config
+		sc.rebalance(newConfig)
+		sc.configs = append(sc.configs, *newConfig)
 		response.Err = OK
 		sc.logRPC(false, operation.ClerkId, operation.SeqNum, "LEAVE operation has been executed!")
 	case MOVE:
+		newConfig := sc.initializeNewConfig()
+		newConfig.Shards[operation.Shard] = operation.GID
+		sc.configs = append(sc.configs, *newConfig)
+		response.Err = OK
 		sc.logRPC(false, operation.ClerkId, operation.SeqNum, "MOVE operation has been executed!")
 	default:
 		sc.logService(true, "ERROR: unknown type of controller operation to be applied!")
 	}
 	return response
+}
+
+// initialize a Config to be the same as last Config except the index
+func (sc *ShardCtrler) initializeNewConfig() *Config {
+	prevConfig := sc.configs[len(sc.configs)-1]
+	newConfig := Config{
+		Num:    prevConfig.Num + 1,
+		Shards: prevConfig.Shards, // go array is passed by value (copy happened)
+		Groups: deepCopyMap(prevConfig.Groups),
+	}
+	return &newConfig
+}
+
+// Re-balance a config to achieve 2 invariants:
+// 1. no shards not yet assigned unless no groups at all
+// 2. the maximum number of a shards managed by a group minus the minimum number will not exceed 1
+// the pointer of ShardCtrler is passed for logging purpose
+func (sc *ShardCtrler) rebalance(cf *Config) {
+	// scenario 1: no groups at all
+	if len(cf.Groups) == 0 {
+		for _, gid := range cf.Shards {
+			if gid != 0 {
+				sc.logService(true, "ERROR: non-zero gid found when no groups at all")
+			}
+		}
+		return
+	}
+	// scenario 2: with some groups
+	// create the auxiliary gid to shards
+	gid2Shards := make(map[int][]int)
+	gid2Shards[0] = make([]int, 0)
+	for gid, _ := range cf.Groups {
+		gid2Shards[gid] = make([]int, 0)
+	}
+	for shardId, gid := range cf.Shards {
+		_, exists := gid2Shards[gid]
+		if !exists {
+			sc.logService(true, "ERROR: found some shards assigned to a non-existed group id %d", gid)
+		}
+		gid2Shards[gid] = append(gid2Shards[gid], shardId)
+	}
+	// first: assign each shard that is not yet assigned
+	if len(gid2Shards[0]) > 0 {
+
+	}
+	// last: assign shards from maxGid to minGid until the gap <= 1
+}
+
+// return the gid associated with the minimum shards and the associated num of shards
+// in case a tie, always return the smallest gid
+func findGidWithMinShards(cf *Config, gid2Shards map[int][]int) (int, int) {
+	minGid := -1
+	minLength := len(cf.Shards) + 1
+	for gid, shards := range gid2Shards {
+		// ignore gid 0, which is not a group
+		if gid == 0 {
+			continue
+		}
+		currentLength := len(shards)
+		if currentLength < minLength || (currentLength == minLength && gid < minGid) {
+			minGid = gid
+			minLength = currentLength
+		}
+	}
+	if minGid <= 0 {
+		log.Fatalf("ERROR: The gid assigned with minimum number of shards does not exists with gid %d\n", minGid)
+	}
+	return minGid, minLength
+}
+
+// return the gid associated with the maximum shards and the associated num of shards
+// in case a tie, always return the minimum gid
+func findGidWithMaxShards(cf *Config, gid2Shards map[int][]int) (int, int) {
+	maxGid := -1
+	maxLength := -1
+	for gid, shards := range gid2Shards {
+		// ignore gid 0, which is not a group
+		if gid == 0 {
+			continue
+		}
+		currentLength := len(shards)
+		if currentLength > maxLength || (currentLength == maxLength && gid < maxGid) {
+			maxGid = gid
+			maxLength = currentLength
+		}
+	}
+	if maxGid <= 0 {
+		log.Fatalf("ERROR: The gid assigned with maximum number of shards does not exists with gid %d\n", maxGid)
+	}
+	return maxGid, maxLength
 }
 
 // Periodically check if the term has changed for each ongoing RPC requests. If the term changed, different from its
@@ -359,4 +482,15 @@ func (sc *ShardCtrler) logRPC(fatal bool, clerkId int64, seqNum int, format stri
 			log.Print(prefixService + prefixClerk + prefixSeq + fmtString + "\n")
 		}
 	}
+}
+
+// deepCopyMap takes a map of int to slice string and returns a deep copy of it.
+func deepCopyMap(originalMap map[int][]string) map[int][]string {
+	newMap := make(map[int][]string)
+	for key, oldSlice := range originalMap {
+		newSlice := make([]string, len(oldSlice))
+		copy(newSlice, oldSlice)
+		newMap[key] = newSlice
+	}
+	return newMap
 }
