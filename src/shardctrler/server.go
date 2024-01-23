@@ -342,10 +342,23 @@ func (sc *ShardCtrler) rebalance(cf *Config) {
 		gid2Shards[gid] = append(gid2Shards[gid], shardId)
 	}
 	// first: assign each shard that is not yet assigned
-	if len(gid2Shards[0]) > 0 {
-
+	for len(gid2Shards[0]) > 0 {
+		destGID, _ := findGidWithMinShards(cf, gid2Shards)
+		var passedShardID int
+		gid2Shards[0], gid2Shards[destGID], passedShardID = passFirstElement(gid2Shards[0], gid2Shards[destGID])
+		cf.Shards[passedShardID] = destGID
 	}
 	// last: assign shards from maxGid to minGid until the gap <= 1
+	for {
+		minGID, minNum := findGidWithMinShards(cf, gid2Shards)
+		maxGID, maxNum := findGidWithMaxShards(cf, gid2Shards)
+		if maxNum-minNum <= 1 {
+			break
+		}
+		var passedShardID int
+		gid2Shards[maxGID], gid2Shards[minGID], passedShardID = passFirstElement(gid2Shards[maxGID], gid2Shards[minGID])
+		cf.Shards[passedShardID] = minGID
+	}
 }
 
 // return the gid associated with the minimum shards and the associated num of shards
@@ -493,4 +506,12 @@ func deepCopyMap(originalMap map[int][]string) map[int][]string {
 		newMap[key] = newSlice
 	}
 	return newMap
+}
+
+// pass the first element of src to dst, return them and the passed value
+func passFirstElement(src []int, dst []int) ([]int, []int, int) {
+	val := src[0]
+	dst = append(dst, src[0])
+	src = src[1:]
+	return src, dst, val
 }
