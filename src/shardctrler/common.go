@@ -38,7 +38,7 @@ type Config struct {
 }
 
 // used to control whether or not print debugging info
-const ControllerDebug = true
+const ControllerDebug = false
 const (
 	OK                = "OK"                // applied
 	ErrWrongLeader    = "ErrWrongLeader"    // the server the clerk talked to is not leader
@@ -69,7 +69,7 @@ type ControllerOperationArgs struct {
 }
 type ControllerOperationReply struct {
 	Err    Err
-	Config Config // used by query operation
+	Config *Config // used by query operation
 }
 
 // int64ToBase64 converts an int64 number to a base64 encoded string.

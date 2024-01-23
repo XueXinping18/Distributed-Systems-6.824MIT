@@ -112,7 +112,7 @@ func (ck *Clerk) ControllerOperation(args *ControllerOperationArgs) *Config {
 		}
 		// Doing RPC to the server.
 		// Note that serverId in client side and server side is different for the same server
-		ok := ck.servers[serverId].Call("KVServer.HandleControllerOperation", args, reply)
+		ok := ck.servers[serverId].Call("ShardCtrler.HandleControllerOperation", args, reply)
 
 		// handle the RPC reply and potentially retry, update the preferred server to send
 		if !ok {
@@ -137,7 +137,7 @@ func (ck *Clerk) ControllerOperation(args *ControllerOperationArgs) *Config {
 		}
 		count++
 	}
-	return &reply.Config
+	return reply.Config
 }
 
 func (ck *Clerk) logClerk(fatal bool, format string, args ...interface{}) {
@@ -158,7 +158,7 @@ func (ck *Clerk) logRPC(fatal bool, seqNum int, serverId int, format string, arg
 	}
 	prefixClerk := "Admin-" + ck.base64IdPrefix + " "
 	prefixSeq := fmt.Sprintf("Seq-%d ", seqNum)
-	prefixService := fmt.Sprintf("ControllerHandle-%d: ", serverId)
+	prefixService := fmt.Sprintf("Controller-%d: ", serverId)
 	message := fmt.Sprintf(format, args...)
 	if fatal {
 		log.Fatalln(prefixClerk + prefixSeq + prefixService + message)
