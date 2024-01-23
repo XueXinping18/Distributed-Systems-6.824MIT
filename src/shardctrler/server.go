@@ -18,7 +18,7 @@ import "6.824/labgob"
 // 3. states are small so no snapshot needs to be taken
 const StaleDetectorSleepMillis int = 1500
 
-// ControllerCommandResponse is used to cache the result of the most recent command from a specific clerk
+// ControllerCommandResponse is used to cache the result of applied command
 type ControllerCommandResponse struct {
 	ClerkId int64
 	SeqNum  int
@@ -111,7 +111,6 @@ func (sc *ShardCtrler) HandleControllerOperation(args *ControllerOperationArgs, 
 	sc.logRPC(false, args.ClerkId, args.SeqNum, "Try to delegate the controller operation to the Raft library")
 
 	indexOrLeader, term, success := sc.rf.Start(op)
-	sc.logRPC(false, args.ClerkId, args.SeqNum, "Finished delegation of controller operation")
 	if !success {
 		reply.Err = ErrWrongLeader
 		sc.logRPC(false, args.ClerkId, args.SeqNum, "Server called by the clerk is not leader controller for term %d!", term)
@@ -186,7 +185,7 @@ func (sc *ShardCtrler) applyChannelObserver() {
 			// update the executed index if executed
 			if applyMsg.CommandIndex > sc.lastExecutedIndex {
 				if applyMsg.CommandIndex != sc.lastExecutedIndex+1 {
-					sc.logService(true, "ERROR: Jump found in the index of executed commands!")
+					sc.logController(true, "ERROR: Jump found in the index of executed commands!")
 				}
 				sc.lastExecutedIndex = applyMsg.CommandIndex
 			}
@@ -198,7 +197,7 @@ func (sc *ShardCtrler) applyChannelObserver() {
 			}
 			sc.mu.Unlock()
 		} else {
-			sc.logService(true, "ERROR: ShardController does not support snapshot but snapshot received!")
+			sc.logController(true, "ERROR: ShardController does not support snapshot but snapshot received!")
 		}
 	}
 }
@@ -209,7 +208,7 @@ func (sc *ShardCtrler) applyChannelObserver() {
 // all operations are synchronous in Raft, so we can safely do nothing
 func (sc *ShardCtrler) validateAndApply(operation *Op) *ControllerCommandResponse {
 	if operation == nil {
-		sc.logService(true, "ERROR: The operation to execute is a nil pointer!")
+		sc.logController(true, "ERROR: The operation to execute is a nil pointer!")
 	}
 	cachedEntry, ok := sc.duplicateTable[operation.ClerkId]
 	// not outdated or duplicated
@@ -240,7 +239,7 @@ func (sc *ShardCtrler) validateAndApply(operation *Op) *ControllerCommandRespons
 // Apply the operation to the in-memory configs stateMachine and put the result into sc.replyEntry
 func (sc *ShardCtrler) apply(operation *Op) *ControllerCommandResponse {
 	if operation == nil {
-		sc.logService(true, "ERROR: The operation to execute is a nil pointer!")
+		sc.logController(true, "ERROR: The operation to execute is a nil pointer!")
 	}
 	response := &ControllerCommandResponse{
 		ClerkId: operation.ClerkId,
@@ -297,7 +296,7 @@ func (sc *ShardCtrler) apply(operation *Op) *ControllerCommandResponse {
 		response.Err = OK
 		sc.logRPC(false, operation.ClerkId, operation.SeqNum, "MOVE operation has been executed!")
 	default:
-		sc.logService(true, "ERROR: unknown type of controller operation to be applied!")
+		sc.logController(true, "ERROR: unknown type of controller operation to be applied!")
 	}
 	return response
 }
@@ -322,7 +321,7 @@ func (sc *ShardCtrler) rebalance(cf *Config) {
 	if len(cf.Groups) == 0 {
 		for _, gid := range cf.Shards {
 			if gid != 0 {
-				sc.logService(true, "ERROR: non-zero gid found when no groups at all")
+				sc.logController(true, "ERROR: non-zero gid found when no groups at all")
 			}
 		}
 		return
@@ -337,7 +336,7 @@ func (sc *ShardCtrler) rebalance(cf *Config) {
 	for shardId, gid := range cf.Shards {
 		_, exists := gid2Shards[gid]
 		if !exists {
-			sc.logService(true, "ERROR: found some shards assigned to a non-existed group id %d", gid)
+			sc.logController(true, "ERROR: found some shards assigned to a non-existed group id %d", gid)
 		}
 		gid2Shards[gid] = append(gid2Shards[gid], shardId)
 	}
@@ -410,12 +409,12 @@ func findGidWithMaxShards(cf *Config, gid2Shards map[int][]int) (int, int) {
 // Note that for safety, the command is still likely to be committed, which might be unsafe. But in the synchronous
 // setting, the client will always retry. Therefore, there is no safety issue in this particular scenario.
 func (sc *ShardCtrler) staleRpcContextDetector() {
-	sc.logService(false, "Start the detector for pending client requests whose log entry is outdated in term...")
+	sc.logController(false, "Start the detector for pending client requests whose log entry is outdated in term...")
 	for !sc.killed() {
 		time.Sleep(time.Duration(StaleDetectorSleepMillis) * time.Millisecond)
 		sc.mu.Lock()
 		currentTerm, isLeader := sc.rf.GetState()
-		sc.logService(false, "Current Term %d; Is server %d leader? "+strconv.FormatBool(isLeader), currentTerm, sc.me)
+		sc.logController(false, "Current Term %d; Is server %d leader? "+strconv.FormatBool(isLeader), currentTerm, sc.me)
 		for _, rpcContext := range sc.rpcContexts {
 			if currentTerm != rpcContext.TermAppended {
 				sc.logRPC(false, rpcContext.ClerkId, rpcContext.SeqNum, "Outdated waiting rpc handler detected!")
@@ -459,7 +458,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.configs[0].Groups = map[int][]string{}
 
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
-	sc.logService(false, "Restart (or start) the controller replica...")
+	sc.logController(false, "Restart (or start) the controller replica...")
 
 	// run background thread
 	go sc.applyChannelObserver()
@@ -468,8 +467,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 }
 
 // logging functions
-// 1. logging info regarding the service itself
-func (sc *ShardCtrler) logService(fatal bool, format string, args ...interface{}) {
+// 1. logging info regarding the controller replica itself
+func (sc *ShardCtrler) logController(fatal bool, format string, args ...interface{}) {
 	if ControllerDebug {
 		prefix := fmt.Sprintf("Controller-%d: ", sc.me)
 		if fatal {
@@ -480,7 +479,7 @@ func (sc *ShardCtrler) logService(fatal bool, format string, args ...interface{}
 	}
 }
 
-// 2. logging info regarding the communication between clerk and service
+// 2. logging info regarding the communication between controller and service
 func (sc *ShardCtrler) logRPC(fatal bool, clerkId int64, seqNum int, format string, args ...interface{}) {
 	if ControllerDebug {
 		// convert id to base64 and take a prefix for logging purpose

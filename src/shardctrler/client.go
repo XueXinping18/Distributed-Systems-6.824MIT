@@ -50,7 +50,7 @@ func (ck *Clerk) Query(index int) Config {
 		ClerkId:  ck.uid,
 		SeqNum:   int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
-	ck.logClerk(false, "Admin issues QUERY operation with id %d.", index)
+	ck.logAdmin(false, "Admin issues QUERY operation with id %d.", index)
 	return *ck.ControllerOperation(args)
 }
 
@@ -61,7 +61,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 		ClerkId: ck.uid,
 		SeqNum:  int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
-	ck.logClerk(false, "Admin issues a JOIN operation.")
+	ck.logAdmin(false, "Admin issues a JOIN operation.")
 	ck.ControllerOperation(args)
 }
 
@@ -72,7 +72,7 @@ func (ck *Clerk) Leave(gids []int) {
 		ClerkId: ck.uid,
 		SeqNum:  int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
-	ck.logClerk(false, "Admin issues a LEAVE operation with gids %v.", gids)
+	ck.logAdmin(false, "Admin issues a LEAVE operation with gids %v.", gids)
 	ck.ControllerOperation(args)
 }
 
@@ -84,7 +84,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 		ClerkId: ck.uid,
 		SeqNum:  int(atomicIncrementAndSwap(&ck.nextSeqNum)),
 	}
-	ck.logClerk(false, "Admin issues a MOVE operation with shard %d to gid %d.", shard, gid)
+	ck.logAdmin(false, "Admin issues a MOVE operation with shard %d to gid %d.", shard, gid)
 	ck.ControllerOperation(args)
 }
 
@@ -97,7 +97,7 @@ func (ck *Clerk) ControllerOperation(args *ControllerOperationArgs) *Config {
 	seqNum := args.SeqNum
 	count := 0
 	for done := false; !done; {
-		ck.logClerk(false, "The number of attempt to send the operation for the SeqNum %d is %d. Do the next attempt!",
+		ck.logAdmin(false, "The number of attempt to send the operation for the SeqNum %d is %d. Do the next attempt!",
 			seqNum, count)
 		// reset reply struct for every retry
 		reply = new(ControllerOperationReply)
@@ -140,7 +140,7 @@ func (ck *Clerk) ControllerOperation(args *ControllerOperationArgs) *Config {
 	return reply.Config
 }
 
-func (ck *Clerk) logClerk(fatal bool, format string, args ...interface{}) {
+func (ck *Clerk) logAdmin(fatal bool, format string, args ...interface{}) {
 	if !ControllerDebug {
 		return
 	}
