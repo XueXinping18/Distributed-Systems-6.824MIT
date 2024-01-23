@@ -1,5 +1,11 @@
 package shardctrler
 
+import (
+	"encoding/base64"
+	"strconv"
+	"sync/atomic"
+)
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -20,6 +26,9 @@ package shardctrler
 // The number of shards.
 const NShards = 10
 
+// used to shorten the uid of a client for logging
+const PrefixLength = 5
+
 // A configuration -- an assignment of shards to groups.
 // Please don't change this.
 type Config struct {
@@ -28,46 +37,62 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+// used to control whether or not print debugging info
+const ControllerDebug = false
 const (
-	OK = "OK"
+	OK                = "OK"                // applied
+	ErrWrongLeader    = "ErrWrongLeader"    // the server the clerk talked to is not leader
+	ErrLogEntryErased = "ErrLogEntryErased" // previous index is detected with a new log entry, definitely not applied
+	ErrTermChanged    = "ErrTermChanged"    // Periodic term detector found that the term of the previous leader has changed, no guarantee if the command will be applied or erased.
+)
+
+type ControllerOperationType int
+
+const (
+	JOIN ControllerOperationType = iota
+	LEAVE
+	MOVE
+	QUERY
 )
 
 type Err string
 
-type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+type ControllerOperationArgs struct {
+	Servers  map[int][]string // used for Join
+	GIDs     []int            // used for Leave
+	Shard    int              // used for Move
+	GID      int              // used for Move
+	ConfigID int              // used for Query
+	Type     ControllerOperationType
+	ClerkId  int64
+	SeqNum   int
+}
+type ControllerOperationReply struct {
+	Err    Err
+	Config *Config // used by query operation
 }
 
-type JoinReply struct {
-	WrongLeader bool
-	Err         Err
+// int64ToBase64 converts an int64 number to a base64 encoded string.
+// used for logging purpose
+func int64ToBase64(number int64) string {
+	bytes := []byte(strconv.FormatInt(number, 10))
+	return base64.StdEncoding.EncodeToString(bytes)
+}
+func base64Prefix(number int64) string {
+	return int64ToBase64(number)[0:PrefixLength]
 }
 
-type LeaveArgs struct {
-	GIDs []int
-}
-
-type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
-type MoveArgs struct {
-	Shard int
-	GID   int
-}
-
-type MoveReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
-type QueryArgs struct {
-	Num int // desired config number
-}
-
-type QueryReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+// used to increment an atomic number
+func atomicIncrementAndSwap(val *int32) int32 {
+	var oldValue int32
+	for {
+		oldValue = atomic.LoadInt32(val)
+		// Try to update the value with oldValue + 1
+		if atomic.CompareAndSwapInt32(val, oldValue, oldValue+1) {
+			// If successful, break out of the loop
+			break
+		}
+		// Otherwise, the loop will continue and try again
+	}
+	return oldValue
 }

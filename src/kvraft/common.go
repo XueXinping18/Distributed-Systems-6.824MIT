@@ -20,20 +20,20 @@ const (
 // used to shorten the uid of a client for logging
 const PrefixLength = 5
 
-type OperationType int
+type KVOperationType int
 
 const (
-	GET OperationType = iota
+	GET KVOperationType = iota
 	PUT
 	APPEND
 )
 
 type Err string
 
-type OperationArgs struct {
+type KVOperationArgs struct {
 	Key   string
-	Value string        // not used in "Get"
-	Type  OperationType // "Put" or "Append"
+	Value string          // not used in "Get"
+	Type  KVOperationType // "Put" or "Append"
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
@@ -41,7 +41,7 @@ type OperationArgs struct {
 	SeqNum  int
 }
 
-type OperationReply struct {
+type KVOperationReply struct {
 	Err   Err
 	Value string // only used by Get
 }
