@@ -8,6 +8,9 @@ import (
 
 // used to control whether or not print debugging info
 const KVDebug = false
+
+type Err string
+
 const (
 	OK                    = "OK"                    // applied
 	ErrNoKey              = "ErrNoKey"              // for GET, applied but no key
@@ -28,17 +31,12 @@ const (
 	APPEND
 )
 
-type Err string
-
 type KVOperationArgs struct {
-	Key   string
-	Value string          // not used in "Get"
-	Type  KVOperationType // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	ClerkId int64
-	SeqNum  int
+	Key     string
+	Value   string          // not used in "Get"
+	Type    KVOperationType // "Put", "Append" or "Get"
+	ClerkId int64           // identify the client
+	SeqNum  int             // to make operation idempotent and eliminate ABA issue
 }
 
 type KVOperationReply struct {

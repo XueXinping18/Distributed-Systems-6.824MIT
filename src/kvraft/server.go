@@ -13,8 +13,7 @@ import (
 	"time"
 )
 
-const RaftStateLengthRatio float64 = 0.8 // the threshold above which the raft state length (mainly log) will trigger taking a snapshot
-// const SnapshotCheckerSleepMills int = 50  // the period to check if a snapshot should be taken, fast enough to pass the grader
+const RaftStateLengthRatio float64 = 0.8  // the threshold above which the raft state length (mainly log) will trigger taking a snapshot
 const StaleDetectorSleepMillis int = 1500 // how long to check if the term deviated from the term a command is appended in log
 // set to be very large because the change of term does not necessarily mean that the entry will be erased. It can still
 // be committed and applied by another leader (if that leader has the replication before the term change)
