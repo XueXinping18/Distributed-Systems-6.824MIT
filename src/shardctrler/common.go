@@ -23,6 +23,9 @@ import (
 // You will need to add fields to the RPC argument structs.
 //
 
+// used to control whether or not print debugging info
+const ControllerDebug = false
+
 // The number of shards.
 const NShards = 10
 
@@ -33,12 +36,10 @@ const PrefixLength = 5
 // Please don't change this.
 type Config struct {
 	Num    int              // config number
-	Shards [NShards]int     // shard -> gid
-	Groups map[int][]string // gid -> servers[]
+	Shards [NShards]int     // shard -> gid (many-to-one mapping)
+	Groups map[int][]string // gid -> servers[] (one-to-many mapping)
 }
 
-// used to control whether or not print debugging info
-const ControllerDebug = false
 const (
 	OK                = "OK"                // applied
 	ErrWrongLeader    = "ErrWrongLeader"    // the server the clerk talked to is not leader
