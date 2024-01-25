@@ -36,6 +36,12 @@ type RpcContext struct {
 	Response     *KVCommandResponse // used by the sender thread to send the response to the receiver handler
 }
 
+// used as the key for shards that has different version as the current config version
+type ShardVersion struct {
+	shard   int
+	version int
+}
+
 // The constructor for RpcContext, mainly for bind the conditional variable to the mutex of the ShardKV
 func (kv *ShardKV) NewRpcContext(clerkId int64, seqNum int, term int) *RpcContext {
 	return &RpcContext{
@@ -51,14 +57,20 @@ func (rpcContext *RpcContext) deliverResponseAndNotify(response *KVCommandRespon
 	rpcContext.replyCond.Broadcast()
 }
 
-// To be serialized and stored in log
+// To be serialized and stored in log as a client operation
 type Op struct {
-	// ClerkId and SeqNum uniquely identify the operation
+	Type OperationType
+	// For Client operations (get, put, append), ClerkId and SeqNum uniquely identify the operation
 	ClerkId int64
 	SeqNum  int
-	Type    KVOperationType
 	Key     string
 	Value   string // not used if the type is GET
+	// For install shards
+	Version        int // the new configID i.e. all the changes on the shards before this configID have been reflected to the shards
+	Shards         map[int]map[string]string
+	DuplicateTable map[int64]*KVCommandResponse // the duplication table so that one operation will not be executed in both group when configuration changes
+	// For update Configuration
+	Config shardctrler.Config
 }
 
 type ShardKV struct {
@@ -76,8 +88,13 @@ type ShardKV struct {
 	snapshotThreshold int                 // calculated based on maxRaftState
 	rpcContexts       map[int]*RpcContext // for each RPC there will be a rpcContext for it to pass in response and notify the finish of response
 	lastExecutedIndex int
-	stateMachine      map[string]string            // the in-memory key-value stateMachine
-	duplicateTable    map[int64]*KVCommandResponse // used to detect duplicated commands to execute or duplicated client request
+
+	duplicateTable       map[int64]*KVCommandResponse       // used to detect duplicated commands to execute or duplicated client request
+	shardedStateMachines map[int]map[string]string          // the in-memory key-value stateMachine, they are partitioned by shardID, done so as the unit of data deletion
+	shardVersions        map[int]int                        // for each shard the server stores, what is the version
+	config               shardctrler.Config                 // the config the shard is currently serving
+	shardBuffer          map[ShardVersion]map[string]string // a layered buffer to store shards that might be loaded into the state machine after the configuration change
+	// the first level is configID AND shardID, the last level is data for the shard that reflected all the changes before configID
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -266,9 +283,10 @@ func (kv *ShardKV) apply(operation *Op) *KVCommandResponse {
 		ClerkId: operation.ClerkId,
 		SeqNum:  operation.SeqNum,
 	}
+	shardID := key2shard(operation.Key)
 	switch operation.Type {
 	case GET:
-		val, ok := kv.stateMachine[operation.Key]
+		val, ok := kv.shardedStateMachines[shardID][operation.Key]
 		response.Value = val
 		if ok {
 			response.Err = OK
@@ -277,12 +295,12 @@ func (kv *ShardKV) apply(operation *Op) *KVCommandResponse {
 		}
 		kv.logRPC(false, operation.ClerkId, operation.SeqNum, "GET operation has been executed!")
 	case PUT:
-		kv.stateMachine[operation.Key] = operation.Value
+		kv.shardedStateMachines[shardID][operation.Key] = operation.Value
 		response.Err = OK
 		response.Value = "" // no value needed for put
 		kv.logRPC(false, operation.ClerkId, operation.SeqNum, "PUT operation has been executed!")
 	case APPEND:
-		kv.stateMachine[operation.Key] = kv.stateMachine[operation.Key] + operation.Value
+		kv.shardedStateMachines[shardID][operation.Key] = kv.shardedStateMachines[shardID][operation.Key] + operation.Value
 		response.Err = OK
 		response.Value = "" // no value needed for append
 		kv.logRPC(false, operation.ClerkId, operation.SeqNum, "APPEND operation has been executed!")
@@ -334,7 +352,7 @@ func (kv *ShardKV) serializeSnapshot() []byte {
 	kv.logService(false, "Serialize the service states into a snapshot!")
 	writeBuffer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writeBuffer)
-	if encoder.Encode(kv.stateMachine) != nil {
+	if encoder.Encode(kv.shardedStateMachines) != nil {
 		kv.logService(true, "Fail to encode the state machine!")
 	}
 	if encoder.Encode(kv.duplicateTable) != nil {
@@ -354,10 +372,10 @@ func (kv *ShardKV) deserializeSnapshot(data []byte) {
 	kv.logService(false, "Deserialize the snapshot into service states!")
 	readBuffer := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(readBuffer)
-	var stateMachine map[string]string
+	var shardedStateMachines map[int]map[string]string
 	var duplicateTable map[int64]*KVCommandResponse
 	var lastExecutedIndex int
-	if decoder.Decode(&stateMachine) != nil {
+	if decoder.Decode(&shardedStateMachines) != nil {
 		kv.logService(false, "Failed to read state machine from snapshot bytes!")
 	}
 	if decoder.Decode(&duplicateTable) != nil {
@@ -366,7 +384,7 @@ func (kv *ShardKV) deserializeSnapshot(data []byte) {
 	if decoder.Decode(&lastExecutedIndex) != nil {
 		kv.logService(false, "Failed to read last executed index from snapshot bytes!")
 	}
-	kv.stateMachine = stateMachine
+	kv.shardedStateMachines = shardedStateMachines
 	kv.duplicateTable = duplicateTable
 	kv.lastExecutedIndex = lastExecutedIndex
 }
@@ -401,21 +419,22 @@ func (kv *ShardKV) deserializeSnapshot(data []byte) {
 // for any long-running work.
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int,
 	controllers []*labrpc.ClientEnd, makeEndFunc func(string) *labrpc.ClientEnd) *ShardKV {
-	labgob.Register(Op{})                // as the command stored in logs
+	labgob.Register(Op{}) // as the command stored in logs
+	labgob.Register(shardctrler.Config{})
 	labgob.Register(KVCommandResponse{}) // as the response cached in duplicate table
 	kv := &ShardKV{
-		me:                me,
-		maxRaftState:      maxraftstate,
-		makeEnd:           makeEndFunc,
-		gid:               gid,
-		controllers:       controllers,
-		applyCh:           make(chan raft.ApplyMsg),
-		dead:              0,
-		stateMachine:      make(map[string]string),
-		duplicateTable:    make(map[int64]*KVCommandResponse),
-		rpcContexts:       make(map[int]*RpcContext),
-		lastExecutedIndex: 0,
-		snapshotThreshold: int(RaftStateLengthRatio * float64(maxraftstate)),
+		me:                   me,
+		maxRaftState:         maxraftstate,
+		makeEnd:              makeEndFunc,
+		gid:                  gid,
+		controllers:          controllers,
+		applyCh:              make(chan raft.ApplyMsg),
+		dead:                 0,
+		shardedStateMachines: make(map[int]map[string]string),
+		duplicateTable:       make(map[int64]*KVCommandResponse),
+		rpcContexts:          make(map[int]*RpcContext),
+		lastExecutedIndex:    0,
+		snapshotThreshold:    int(RaftStateLengthRatio * float64(maxraftstate)),
 	}
 	kv.mck = shardctrler.MakeClerk(controllers)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
