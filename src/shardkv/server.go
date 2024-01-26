@@ -16,14 +16,15 @@ import "6.824/labgob"
 
 const RaftStateLengthRatio float64 = 0.8  // the threshold above which the raft state length (mainly log) will trigger taking a snapshot
 const StaleDetectorSleepMillis int = 1500 // how long to check if the term deviated from the term a command is appended in log
-
-// KVCommandResponse is used to cache the result of the most recent command from a specific clerk
+const QueryConfigMillis int = 80          // periodically issue query to shard controller for latest config
+// RpcResponse is used to cache the result of the most recent command from a specific clerk
+// It is also the encapsulated class for the applier to deliver assembled response to the corresponding RPC context, both ClientOperation and InstallShards
 // Because the design is synchronous, duplication with uncertainty only happens for the most recent command
 // (i.e. the client always retry the previous unsuccessful command before it issues the new command)
-type KVCommandResponse struct {
-	ClerkId int64
-	SeqNum  int
-	Err     Err
+type RpcResponse struct {
+	ClerkId int64  // only used for client operation, not used for InstallShards
+	SeqNum  int    // only used for client operation, not used for InstallShards
+	Err     Err    // used for InstallShards to reply
 	Value   string // only useful for GET command
 }
 
@@ -31,15 +32,21 @@ type KVCommandResponse struct {
 type RpcContext struct {
 	ClerkId      int64
 	SeqNum       int
-	TermAppended int                // record the term that the log is appended, invalidate the request if the change of term detected
-	replyCond    *sync.Cond         // used to wake up the waiting RPC handler after response is assembled
-	Response     *KVCommandResponse // used by the sender thread to send the response to the receiver handler
+	TermAppended int          // record the term that the log is appended, invalidate the request if the change of term detected
+	replyCond    *sync.Cond   // used to wake up the waiting RPC handler after response is assembled
+	Response     *RpcResponse // used by the sender thread to send the response to the receiver handler
 }
 
 // used as the key for shards that has different version as the current config version
 type ShardVersion struct {
 	shard   int
 	version int
+}
+
+// used for shard sender to schedule which shards to send to which group
+type SendJob struct {
+	SV      ShardVersion
+	DestGID int
 }
 
 // The constructor for RpcContext, mainly for bind the conditional variable to the mutex of the ShardKV
@@ -52,13 +59,14 @@ func (kv *ShardKV) NewRpcContext(clerkId int64, seqNum int, term int) *RpcContex
 		Response:     nil,
 	}
 }
-func (rpcContext *RpcContext) deliverResponseAndNotify(response *KVCommandResponse) {
+func (rpcContext *RpcContext) deliverResponseAndNotify(response *RpcResponse) {
 	rpcContext.Response = response
 	rpcContext.replyCond.Broadcast()
 }
 
 // To be serialized and stored in log as a client operation
 type Op struct {
+	// For all operations
 	Type OperationType
 	// For Client operations (get, put, append), ClerkId and SeqNum uniquely identify the operation
 	ClerkId int64
@@ -68,7 +76,7 @@ type Op struct {
 	// For install shards
 	Version        int // the new configID i.e. all the changes on the shards before this configID have been reflected to the shards
 	Shards         map[int]map[string]string
-	DuplicateTable map[int64]*KVCommandResponse // the duplication table so that one operation will not be executed in both group when configuration changes
+	DuplicateTable map[int64]*RpcResponse // the duplication table so that one operation will not be executed in both group when configuration changes
 	// For update Configuration
 	Config shardctrler.Config
 }
@@ -89,12 +97,15 @@ type ShardKV struct {
 	rpcContexts       map[int]*RpcContext // for each RPC there will be a rpcContext for it to pass in response and notify the finish of response
 	lastExecutedIndex int
 
-	duplicateTable       map[int64]*KVCommandResponse       // used to detect duplicated commands to execute or duplicated client request
-	shardedStateMachines map[int]map[string]string          // the in-memory key-value stateMachine, they are partitioned by shardID, done so as the unit of data deletion
-	shardVersions        map[int]int                        // for each shard the server stores, what is the version
-	config               shardctrler.Config                 // the config the shard is currently serving
-	shardBuffer          map[ShardVersion]map[string]string // a layered buffer to store shards that might be loaded into the state machine after the configuration change
+	duplicateTable       map[int64]*RpcResponse    // used to detect duplicated commands to execute or duplicated client request
+	shardedStateMachines map[int]map[string]string // the in-memory key-value stateMachine, they are partitioned by shardID, done so as the unit of data deletion
+	config               shardctrler.Config        // the config the shard is currently serving
+	// once a configuration change observed in controller, the group stop serve some shards
+	precludedShards map[int]bool // optional, used when a new incrementConfig is appended to log but yet to be applied. Prevent client operations on the to-be-removed shards from entering the log after the updateConfig log
+	// isNextConfigInLog    bool                               // optional, set to true after a new config appended to log but not applied yet. Prevent repeatedly enter into log for the same config
+	shardBuffer map[ShardVersion]map[string]string // a layered buffer to store shards that are not for the current config
 	// the first level is configID AND shardID, the last level is data for the shard that reflected all the changes before configID
+	shardToSendQueue []SendJob // the queue to send shards to other groups
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -110,6 +121,11 @@ func (kv *ShardKV) killed() bool {
 	return z == 1
 }
 
+// send the installShards message to the correct server, it encapsulated retry logic
+func (kv *ShardKV) installShards() {
+
+}
+
 // The RPC handler for all GET, PUT and APPEND operation
 func (kv *ShardKV) HandleKVOperation(args *KVOperationArgs, reply *KVOperationReply) {
 	kv.mu.Lock()
@@ -120,14 +136,14 @@ func (kv *ShardKV) HandleKVOperation(args *KVOperationArgs, reply *KVOperationRe
 		reply.Err = cache.Err
 		reply.Value = cache.Value
 		// without entering raft.Start(), no leader info can be reported back to the client
-		kv.logRPC(false, args.ClerkId, args.SeqNum, "Executed command found in RPC handler and must reply again")
+		kv.logClientRPC(false, args.ClerkId, args.SeqNum, "Executed command found in RPC handler and must reply again")
 		return
 	}
 	// outdated command, the response for which the client must have seen, irrelevant,
 	// (in RPC, the client has marked the packet as lost and move on to retry, so the error is not visible by the client)
 	if ok && cache.SeqNum > args.SeqNum {
 		reply.Err = OK
-		kv.logRPC(false, args.ClerkId, args.SeqNum, "Executed command found in RPC handler and the client"+
+		kv.logClientRPC(false, args.ClerkId, args.SeqNum, "Executed command found in RPC handler and the client"+
 			" is guaranteed to have seen the response! Simply ignored!")
 		return
 	}
@@ -138,13 +154,12 @@ func (kv *ShardKV) HandleKVOperation(args *KVOperationArgs, reply *KVOperationRe
 		Key:     args.Key,
 		Value:   args.Value,
 	}
-	kv.logRPC(false, args.ClerkId, args.SeqNum, "Try to delegate the command to the Raft library")
+	kv.logClientRPC(false, args.ClerkId, args.SeqNum, "Try to delegate client command to the Raft library")
 
 	indexOrLeader, term, success := kv.rf.Start(op)
-	kv.logRPC(false, args.ClerkId, args.SeqNum, "Finished delegation of command")
 	if !success {
 		reply.Err = ErrWrongLeader
-		kv.logRPC(false, args.ClerkId, args.SeqNum, "Service called by the clerk is not leader for term %d!", term)
+		kv.logClientRPC(false, args.ClerkId, args.SeqNum, "Service called by the clerk is not leader for term %d!", term)
 		return
 	}
 	// scenario: successfully append the command to the log
@@ -157,8 +172,8 @@ func (kv *ShardKV) HandleKVOperation(args *KVOperationArgs, reply *KVOperationRe
 		// Here is a very interesting corner case: if the clerkId, seqNum, index and the leaderId are all the same
 		// (which implies a different term), we can still suggest the handler to resend because next time it is
 		// most likely to be detected by duplicateTable (either during initial check or check before execution)
-		kv.logRPC(false, args.ClerkId, args.SeqNum, "There is already an RpcContext at the index where the command can reside")
-		response := &KVCommandResponse{
+		kv.logClientRPC(false, args.ClerkId, args.SeqNum, "There is already an RpcContext at the index where the command can reside")
+		response := &RpcResponse{
 			ClerkId: prevContext.ClerkId,
 			SeqNum:  prevContext.SeqNum,
 			Err:     ErrLogEntryErased,
@@ -169,35 +184,36 @@ func (kv *ShardKV) HandleKVOperation(args *KVOperationArgs, reply *KVOperationRe
 	kv.rpcContexts[indexOrLeader] = currentContext
 	// If the leadership changed during waiting for reply, and the command is not erased with its index occupied by another command,
 	// e.g. serving a single client, then it might wait forever. We need to detect the change of term
-	kv.logRPC(false, args.ClerkId, args.SeqNum, "Started to wait for the apply of the command and response assembled")
+	kv.logClientRPC(false, args.ClerkId, args.SeqNum, "Started to wait for the applyClientOperation of the command and response assembled")
 	// blocking to receive response
 	currentContext.replyCond.Wait()
 	delete(kv.rpcContexts, indexOrLeader)
 	response := currentContext.Response
 	if response == nil {
-		kv.logRPC(true, args.ClerkId, args.SeqNum, "ERROR: RPC handler woken up but the response is nil!")
+		kv.logClientRPC(true, args.ClerkId, args.SeqNum, "ERROR: RPC handler woken up but the response is nil!")
 	}
-	kv.logRPC(false, args.ClerkId, args.SeqNum, "Received assembled response, wake up the RPC handler")
+	kv.logClientRPC(false, args.ClerkId, args.SeqNum, "Received assembled response, wake up the RPC handler")
 	if response.SeqNum != args.SeqNum || response.ClerkId != args.ClerkId || response.Err == ErrLogEntryErased {
 		// mismatch found, the log entry must have been cleaned up
 		reply.Err = ErrLogEntryErased
-		kv.logRPC(false, args.ClerkId, args.SeqNum, "Log entry appended found removed! Reply error")
+		kv.logClientRPC(false, args.ClerkId, args.SeqNum, "Log entry appended found removed! Reply error")
 		return
 	} else {
 		// matched correctly
 		reply.Value, reply.Err = response.Value, response.Err
-		kv.logRPC(false, args.ClerkId, args.SeqNum, "Correctly reply the client the response generated by applyChannelObserver")
+		kv.logClientRPC(false, args.ClerkId, args.SeqNum, "Correctly reply the client the response generated by applyChannelObserver")
 		return
 	}
 }
 
-// Observe the applyChannel to actually apply to the in-memory stateMachine
+// Observe the applyChannel to actually applyClientOperation to the in-memory stateMachine and other fields
 // if the server is the server that talks to the client, notify the client
+// if the server is the server that talks to the shard sender, notify the shard sender
 // by waking up the RPC thread
 func (kv *ShardKV) applyChannelObserver() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
-		// must wait until the kv.replyEntry has been properly handled to apply the next command and update kv.replyEntry
+		// must wait until the kv.replyEntry has been properly handled to applyClientOperation the next command and update kv.replyEntry
 		kv.mu.Lock()
 		if applyMsg.CommandValid {
 			op := applyMsg.Command.(Op)          // type assertion into Op so that the operation can be applied
@@ -217,10 +233,10 @@ func (kv *ShardKV) applyChannelObserver() {
 				kv.rf.Snapshot(kv.lastExecutedIndex, snapshot)
 			}
 			rpcContext, ok := kv.rpcContexts[applyMsg.CommandIndex]
-			// reply if there is a matched RPC handler (i.e. the leader that talked to the client is the current server)
-			if ok {
+			// reply if there is a matched RPC handler (i.e. the leader that talked to the client/shard sender is the current server)
+			if response == nil || ok {
 				rpcContext.deliverResponseAndNotify(response)
-				kv.logRPC(false, response.ClerkId, response.SeqNum, "Notify the RPC handler with the reply message!")
+				kv.logClientRPC(false, response.ClerkId, response.SeqNum, "Notify the RPC handler with the reply message!")
 			}
 			kv.mu.Unlock()
 		} else if applyMsg.SnapshotValid {
@@ -231,7 +247,7 @@ func (kv *ShardKV) applyChannelObserver() {
 			kv.logService(false, "Received from Raft an entire up-to-date snapshot!")
 			kv.deserializeSnapshot(applyMsg.Snapshot)
 			if applyMsg.SnapshotIndex != kv.lastExecutedIndex {
-				kv.logService(true, "ERROR: Index deserialized from snapshot not equal to the index in the apply message!")
+				kv.logService(true, "ERROR: Index deserialized from snapshot not equal to the index in the applyClientOperation message!")
 			}
 			kv.mu.Unlock()
 		} else {
@@ -244,28 +260,33 @@ func (kv *ShardKV) applyChannelObserver() {
 // update the replyEntry accordingly
 // if the seqNum is smaller than the cached seqNum for the clerk, the clerk must have received the reply because
 // all operations are synchronous in Raft, so we can safely do nothing
-func (kv *ShardKV) validateAndApply(operation *Op) *KVCommandResponse {
+// For InstallShards and Client Operation, retry the RpcResponse
+// For IncrementConfig, where there is no RPC context associated, return nil
+func (kv *ShardKV) validateAndApply(operation *Op) *RpcResponse {
 	if operation == nil {
 		kv.logService(true, "ERROR: The operation to execute is a nil pointer!")
 	}
+	if operation.Type == INCREMENTCONFIG {
+		kv.applyIncrementConfig(operation)
+	}
 	cachedEntry, ok := kv.duplicateTable[operation.ClerkId]
 	// not outdated or duplicated
-	var response *KVCommandResponse
+	var response *RpcResponse
 	if !ok || cachedEntry.SeqNum < operation.SeqNum {
-		response = kv.apply(operation)
+		response = kv.applyClientOperation(operation)
 		// store the result (especially GET) to duplicateTable
 		kv.duplicateTable[operation.ClerkId] = response // by pointer assign to duplicateTable
 	} else if cachedEntry.SeqNum == operation.SeqNum {
 		// duplicated, need to resend reply
 		response = cachedEntry
-		kv.logRPC(false, operation.ClerkId, operation.SeqNum, "Executed command found in apply channel and must reply again")
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Executed command found in applyClientOperation channel and must reply again")
 	} else {
 		// lagged behind operation, the response will be ignored by clerk because the clerk has received reply
-		kv.logRPC(false, operation.ClerkId, operation.SeqNum, "Executed command found in apply channel and the client"+
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Executed command found in applyClientOperation channel and the client"+
 			" is guaranteed to have seen the response! Simply ignored!")
 		// just return an empty response as the client is guaranteed to see the response already
 		// it will be discarded by the clerk anyway
-		response = &KVCommandResponse{
+		response = &RpcResponse{
 			ClerkId: operation.ClerkId,
 			SeqNum:  operation.SeqNum,
 			Err:     OK,
@@ -274,12 +295,50 @@ func (kv *ShardKV) validateAndApply(operation *Op) *KVCommandResponse {
 	return response
 }
 
+// Apply the operation to increment Config
+func (kv *ShardKV) applyIncrementConfig(operation *Op) {
+	// it should be impossible to have jump or going backward in config updates when applying Increment Config
+	newVersion := operation.Config.Num
+	if operation.Config.Num > 1+kv.getCurrentVersion() || operation.Config.Num < kv.getCurrentVersion() {
+		kv.logService(true, "ERROR: Attempted to update config from %d to %d.", kv.getCurrentVersion(), operation.Config.Num)
+	} else if operation.Config.Num == kv.getCurrentVersion() {
+		kv.logConfigChange(false, kv.getCurrentVersion(), "This update in configuration has happened before, no need to apply again!")
+	} else {
+		shardsToReceive, shardsToSend, _, shardsToInitialize, shardsToDelete := CompareConfigs(kv.gid, kv.config, operation.Config)
+		// clear the preclusion set because no longer useful
+		for k := range kv.precludedShards {
+			delete(kv.precludedShards, k)
+		}
+		// process each types of shards operation
+		// 1. schedule to send shards to other group
+		for _, shardId := range shardsToSend {
+			// which version (new) and shard to send
+			sv := ShardVersion{shardId, newVersion}
+			// where to send
+			destGid := operation.Config.Shards[shardId]
+			// if data to send already available
+			shardData, ok := kv.shardedStateMachines[shardId]
+			if !ok { // if the shard is not in the shardedStateMachines, the shard is not ready yet before it no longer owns it
+				kv.logShardSender(false, newVersion, shardId, newVersion, "Shard not received yet when required to be resent to another group")
+			} else {
+				// switch the data to buffer zone
+				kv.logShardSender(false, newVersion, shardId, newVersion, "Shard switched to buffer zone to be sent")
+				delete(kv.shardedStateMachines, shardId)
+				kv.shardBuffer[sv] = shardData
+			}
+			kv.logShardSender(false, newVersion, shardId, newVersion, "Produced a job to send shard")
+			kv.shardToSendQueue = append(kv.shardToSendQueue, SendJob{sv, destGid})
+		}
+		// 2. create shards that are previously not assigned
+	}
+}
+
 // Apply the operation to the in-memory kv stateMachine and put the result into kv.replyEntry
-func (kv *ShardKV) apply(operation *Op) *KVCommandResponse {
+func (kv *ShardKV) applyClientOperation(operation *Op) *RpcResponse {
 	if operation == nil {
 		kv.logService(true, "ERROR: The operation to execute is a nil pointer!")
 	}
-	response := &KVCommandResponse{
+	response := &RpcResponse{
 		ClerkId: operation.ClerkId,
 		SeqNum:  operation.SeqNum,
 	}
@@ -293,17 +352,17 @@ func (kv *ShardKV) apply(operation *Op) *KVCommandResponse {
 		} else {
 			response.Err = ErrNoKey
 		}
-		kv.logRPC(false, operation.ClerkId, operation.SeqNum, "GET operation has been executed!")
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "GET operation has been executed!")
 	case PUT:
 		kv.shardedStateMachines[shardID][operation.Key] = operation.Value
 		response.Err = OK
 		response.Value = "" // no value needed for put
-		kv.logRPC(false, operation.ClerkId, operation.SeqNum, "PUT operation has been executed!")
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "PUT operation has been executed!")
 	case APPEND:
 		kv.shardedStateMachines[shardID][operation.Key] = kv.shardedStateMachines[shardID][operation.Key] + operation.Value
 		response.Err = OK
 		response.Value = "" // no value needed for append
-		kv.logRPC(false, operation.ClerkId, operation.SeqNum, "APPEND operation has been executed!")
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "APPEND operation has been executed!")
 	default:
 		kv.logService(true, "ERROR: unknown type of operation to be applied!")
 	}
@@ -315,7 +374,7 @@ func (kv *ShardKV) apply(operation *Op) *KVCommandResponse {
 // Note that for safety, the command is still likely to be committed, which might be unsafe. But in the synchronous
 // setting, the client will always retry. Therefore, there is no safety issue in this particular scenario.
 func (kv *ShardKV) staleRpcContextDetector() {
-	kv.logService(false, "Start the detector for pending client requests whose log entry is outdated in term...")
+	kv.logService(false, "Start the detector for pending client requests whose log entry is outdated w.r.t. term...")
 	for !kv.killed() {
 		time.Sleep(time.Duration(StaleDetectorSleepMillis) * time.Millisecond)
 		kv.mu.Lock()
@@ -323,15 +382,59 @@ func (kv *ShardKV) staleRpcContextDetector() {
 		kv.logService(false, "Current Term %d; Is server %d leader? "+strconv.FormatBool(isLeader), currentTerm, kv.me)
 		for _, rpcContext := range kv.rpcContexts {
 			if currentTerm != rpcContext.TermAppended {
-				kv.logRPC(false, rpcContext.ClerkId, rpcContext.SeqNum, "Outdated waiting rpc handler detected!")
-				reply := &KVCommandResponse{
+				kv.logClientRPC(false, rpcContext.ClerkId, rpcContext.SeqNum, "Outdated waiting rpc handler detected!")
+				reply := &RpcResponse{
 					ClerkId: rpcContext.ClerkId,
 					SeqNum:  rpcContext.SeqNum,
 					Err:     ErrTermChanged,
 				}
 				rpcContext.deliverResponseAndNotify(reply)
-				kv.logRPC(false, rpcContext.ClerkId, rpcContext.SeqNum, "Notify ErrTermChanged to the handler!")
+				kv.logClientRPC(false, rpcContext.ClerkId, rpcContext.SeqNum, "Notify ErrTermChanged to the handler!")
 			}
+		}
+		kv.mu.Unlock()
+	}
+}
+
+// Periodically issue query for latest config to the shard controller
+func (kv *ShardKV) configQueryIssuer() {
+	kv.logService(false, "Start to periodically issue queries for latest config if it is leader...")
+	for !kv.killed() {
+		time.Sleep(time.Duration(QueryConfigMillis) * time.Millisecond)
+		kv.mu.Lock()
+		// non-leader just sleep
+		if _, isLeader := kv.rf.GetState(); !isLeader {
+			kv.mu.Unlock()
+			continue
+		}
+		// increment the version by at most 1 each time
+		nextVersion := kv.getCurrentVersion() + 1
+		kv.mu.Unlock()
+		latestConfig := kv.mck.Query(nextVersion) //blocking operation so no lock
+		kv.mu.Lock()
+		// TODO: the same config might enter the log multiple times before the config is applied
+		if latestConfig.Num == kv.getCurrentVersion()+1 {
+			// optionally, prevent client operations on the about-to-be-removed shards from entering the log
+			// because these log entries are after the configUpdate entry. They will not be applied anyway
+			_, shardsToSend, _, _, _ := CompareConfigs(kv.gid, kv.config, latestConfig)
+			for _, shard := range shardsToSend {
+				kv.precludedShards[shard] = true
+			}
+			op := Op{
+				Type:   INCREMENTCONFIG,
+				Config: latestConfig,
+			}
+			kv.logConfigChange(false, latestConfig.Num, "Try to delegate new config to the Raft library")
+			indexOrLeader, term, success := kv.rf.Start(op)
+			if !success {
+				kv.logConfigChange(false, indexOrLeader, "Fail to add new config to log because the server is "+
+					"not leader in term %d, with the leader %d", term, indexOrLeader)
+			} else {
+				kv.logConfigChange(false, latestConfig.Num, "New Config added to the log at index %d!", indexOrLeader)
+			}
+		} else if latestConfig.Num < kv.getCurrentVersion() || latestConfig.Num > kv.getCurrentVersion()+1 {
+			// break the invariant. The linearizability of controller operations prevent it
+			kv.logService(true, "ERROR: Latest Config polled from controller has impossible version number!")
 		}
 		kv.mu.Unlock()
 	}
@@ -373,7 +476,7 @@ func (kv *ShardKV) deserializeSnapshot(data []byte) {
 	readBuffer := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(readBuffer)
 	var shardedStateMachines map[int]map[string]string
-	var duplicateTable map[int64]*KVCommandResponse
+	var duplicateTable map[int64]*RpcResponse
 	var lastExecutedIndex int
 	if decoder.Decode(&shardedStateMachines) != nil {
 		kv.logService(false, "Failed to read state machine from snapshot bytes!")
@@ -421,7 +524,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	controllers []*labrpc.ClientEnd, makeEndFunc func(string) *labrpc.ClientEnd) *ShardKV {
 	labgob.Register(Op{}) // as the command stored in logs
 	labgob.Register(shardctrler.Config{})
-	labgob.Register(KVCommandResponse{}) // as the response cached in duplicate table
+	labgob.Register(RpcResponse{}) // as the response cached in duplicate table
 	kv := &ShardKV{
 		me:                   me,
 		maxRaftState:         maxraftstate,
@@ -431,10 +534,12 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		applyCh:              make(chan raft.ApplyMsg),
 		dead:                 0,
 		shardedStateMachines: make(map[int]map[string]string),
-		duplicateTable:       make(map[int64]*KVCommandResponse),
+		shardBuffer:          make(map[ShardVersion]map[string]string),
+		duplicateTable:       make(map[int64]*RpcResponse),
 		rpcContexts:          make(map[int]*RpcContext),
 		lastExecutedIndex:    0,
 		snapshotThreshold:    int(RaftStateLengthRatio * float64(maxraftstate)),
+		config:               *shardctrler.MakeEmptyConfig(),
 	}
 	kv.mck = shardctrler.MakeClerk(controllers)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -446,6 +551,38 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.applyChannelObserver()
 	go kv.staleRpcContextDetector()
 	return kv
+}
+
+// utility functions
+func (kv *ShardKV) getCurrentVersion() int {
+	return kv.config.Num
+}
+func CompareConfigs(gid int, oldConfig shardctrler.Config, newConfig shardctrler.Config) ([]int, []int, []int, []int, []int) {
+	if gid == 0 {
+		panic("Gid in compare Configs should never be 0!")
+	}
+	oldShards := oldConfig.GetShardsManagedBy(gid)
+	newShards := newConfig.GetShardsManagedBy(gid)
+	var shardsToReceive, shardsToSend, noChangeShards, shardsToInitialize, shardsToDelete []int
+	for shard := range oldShards {
+		_, exists := newShards[shard]
+		if exists {
+			noChangeShards = append(noChangeShards, shard)
+		} else if newConfig.Shards[shard] != 0 { // will be assigned to another group
+			shardsToSend = append(shardsToSend, shard)
+		} else { // will not be assigned to any group
+			shardsToDelete = append(shardsToDelete, shard)
+		}
+	}
+	for shard := range newShards {
+		_, exists := oldShards[shard]
+		if !exists && oldConfig.Shards[shard] != 0 { // previously a shard assigned to another group
+			shardsToReceive = append(shardsToReceive, shard)
+		} else if !exists && oldConfig.Shards[shard] == 0 { // previously not assigned to any group, create an empty new shard
+			shardsToInitialize = append(shardsToInitialize, shard)
+		}
+	}
+	return shardsToReceive, shardsToSend, noChangeShards, shardsToInitialize, shardsToDelete
 }
 
 // logging functions
@@ -462,7 +599,7 @@ func (kv *ShardKV) logService(fatal bool, format string, args ...interface{}) {
 }
 
 // 2. logging info regarding the communication between clerk and service
-func (kv *ShardKV) logRPC(fatal bool, clerkId int64, seqNum int, format string, args ...interface{}) {
+func (kv *ShardKV) logClientRPC(fatal bool, clerkId int64, seqNum int, format string, args ...interface{}) {
 	if ShardKVDebug {
 		// convert id to base64 and take a prefix for logging purpose
 		clerkStr := base64Prefix(clerkId)
@@ -475,5 +612,43 @@ func (kv *ShardKV) logRPC(fatal bool, clerkId int64, seqNum int, format string, 
 		} else {
 			log.Print(prefixService + prefixClerk + prefixSeq + fmtString + "\n")
 		}
+	}
+}
+
+// 3. logging info regarding configuration change of the server
+func (kv *ShardKV) logConfigChange(fatal bool, newVersion int, format string, args ...interface{}) {
+	if ShardKVDebug {
+		prefix := fmt.Sprintf("Service-%d-%d ConfigChange-%d->%d: ", kv.gid, kv.me, newVersion-1, newVersion)
+		if fatal {
+			log.Fatalf(prefix+format+"\n", args...)
+		} else {
+			log.Printf(prefix+format+"\n", args...)
+		}
+	}
+}
+
+// 4. logging info regarding sending each shard
+func (kv *ShardKV) logShardSender(fatal bool, shardId int, shardVersion int, destGid int, format string, args ...interface{}) {
+	if !ShardKVDebug {
+		return
+	}
+	prefix := fmt.Sprintf("Service-%d-%d Shard-%d Version-%d DestGroup-%d: ", kv.gid, kv.me, shardId, shardVersion, destGid)
+	if fatal {
+		log.Fatalf(prefix+format+"\n", args...)
+	} else {
+		log.Printf(prefix+format+"\n", args...)
+	}
+}
+
+// 4. logging info regarding receiving each shard
+func (kv *ShardKV) logShardReceiver(fatal bool, shardId int, shardVersion int, sourceGid int, format string, args ...interface{}) {
+	if !ShardKVDebug {
+		return
+	}
+	prefix := fmt.Sprintf("Service-%d-%d Shard-%d Version-%d SourceGroup-%d: ", kv.gid, kv.me, shardId, shardVersion, sourceGid)
+	if fatal {
+		log.Fatalf(prefix+format+"\n", args...)
+	} else {
+		log.Printf(prefix+format+"\n", args...)
 	}
 }
