@@ -40,6 +40,25 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[] (one-to-many mapping)
 }
 
+// create a config that has no groups and all shards assigned to 0 (i.e. not assigned to any group)
+func MakeEmptyConfig() *Config {
+	return &Config{
+		Num:    0,
+		Groups: make(map[int][]string),
+	}
+}
+
+// given a Config and a gid, determine all shards the group manages as a set
+func (config *Config) GetShardsManagedBy(gid int) map[int]bool {
+	set := make(map[int]bool)
+	for shardId, group := range config.Shards {
+		if group == gid {
+			set[shardId] = true
+		}
+	}
+	return set
+}
+
 const (
 	OK                = "OK"                // applied
 	ErrWrongLeader    = "ErrWrongLeader"    // the server the clerk talked to is not leader
