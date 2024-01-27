@@ -271,6 +271,7 @@ func (kv *ShardKV) validateAndApply(operation *Op) *RpcResponse {
 	}
 	if operation.Type == INCREMENTCONFIG {
 		kv.applyIncrementConfig(operation)
+		return nil
 	}
 	cachedEntry, ok := kv.duplicateTable[operation.ClerkId]
 	// not outdated or duplicated
