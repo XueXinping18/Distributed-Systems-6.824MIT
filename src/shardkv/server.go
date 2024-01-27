@@ -39,14 +39,16 @@ type RpcContext struct {
 
 // used as the key for shards that has different version as the current config version
 type ShardVersion struct {
-	shard   int
-	version int
+	Shard   int
+	Version int
 }
 
-// used for shard sender to schedule which shards to send to which group
-type SendJob struct {
-	SV      ShardVersion
-	DestGID int
+// used for shard sender to store info about unfinished send jobs
+type SendJobContext struct {
+	Shard      int
+	OldVersion int // the version that the shard has on the shardBuffer.
+	NewVersion int // the version of the shard before which updates are reflected on the data, might be mismatched
+	DestGID    int
 }
 
 // The constructor for RpcContext, mainly for bind the conditional variable to the mutex of the ShardKV
@@ -105,7 +107,8 @@ type ShardKV struct {
 	// isNextConfigInLog    bool                               // optional, set to true after a new config appended to log but not applied yet. Prevent repeatedly enter into log for the same config
 	shardBuffer map[ShardVersion]map[string]string // a layered buffer to store shards that are not for the current config
 	// the first level is configID AND shardID, the last level is data for the shard that reflected all the changes before configID
-	shardToSendQueue []SendJob // the queue to send shards to other groups
+	shardToSendJobs    []SendJobContext // the queue of unfinished jobs to send shards to other groups
+	shardToInstallJobs map[int]int      // the set of unfinished jobs to install shards to the state machine after receipt. key: shardId, value: version expected
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -304,7 +307,7 @@ func (kv *ShardKV) applyIncrementConfig(operation *Op) {
 	} else if operation.Config.Num == kv.getCurrentVersion() {
 		kv.logConfigChange(false, kv.getCurrentVersion(), "This update in configuration has happened before, no need to apply again!")
 	} else {
-		shardsToReceive, shardsToSend, _, shardsToInitialize, shardsToDelete := CompareConfigs(kv.gid, kv.config, operation.Config)
+		shardsToReceive, shardsToSend, _, shardsToInitialize := CompareConfigs(kv.gid, kv.config, operation.Config)
 		// clear the preclusion set because no longer useful
 		for k := range kv.precludedShards {
 			delete(kv.precludedShards, k)
@@ -312,24 +315,80 @@ func (kv *ShardKV) applyIncrementConfig(operation *Op) {
 		// process each types of shards operation
 		// 1. schedule to send shards to other group
 		for _, shardId := range shardsToSend {
-			// which version (new) and shard to send
-			sv := ShardVersion{shardId, newVersion}
+			var sendJob SendJobContext
 			// where to send
 			destGid := operation.Config.Shards[shardId]
-			// if data to send already available
-			shardData, ok := kv.shardedStateMachines[shardId]
-			if !ok { // if the shard is not in the shardedStateMachines, the shard is not ready yet before it no longer owns it
-				kv.logShardSender(false, newVersion, shardId, newVersion, "Shard not received yet when required to be resent to another group")
+			// check if data to send already available
+			shardData, exists := kv.shardedStateMachines[shardId]
+			if !exists { // if the shard is not in the shardedStateMachines, the shard is not ready yet before it no longer owns it
+				kv.logShardSender(false, shardId, newVersion, destGid, "Shard not received yet when required to be resent to another group")
+				// remove the corresponding previous installation job and give the job a hint that the old version and the new version is the same version
+				oldVersionExpected, installJobExists := kv.shardToInstallJobs[shardId]
+				if !installJobExists {
+					kv.logShardSender(true, shardId, newVersion, destGid, "ERROR: Shard required to be sent is neither in state machine nor in install jobs!")
+				}
+				delete(kv.shardToInstallJobs, shardId)
+				// create a sendJob reflecting the equivalence of old version shard and new version shard
+				sendJob = SendJobContext{
+					Shard:      shardId,
+					OldVersion: oldVersionExpected,
+					NewVersion: newVersion,
+					DestGID:    destGid,
+				}
 			} else {
+				// shard already in the stateMachine
 				// switch the data to buffer zone
-				kv.logShardSender(false, newVersion, shardId, newVersion, "Shard switched to buffer zone to be sent")
+				kv.logShardSender(false, shardId, newVersion, destGid, "Shard switched to buffer zone to be sent")
 				delete(kv.shardedStateMachines, shardId)
-				kv.shardBuffer[sv] = shardData
+				kv.shardBuffer[ShardVersion{shardId, newVersion}] = shardData
+				// create the job to job-list for asynchronously sending
+				sendJob = SendJobContext{
+					Shard:      shardId,
+					OldVersion: newVersion,
+					NewVersion: newVersion,
+					DestGID:    destGid,
+				}
 			}
-			kv.logShardSender(false, newVersion, shardId, newVersion, "Produced a job to send shard")
-			kv.shardToSendQueue = append(kv.shardToSendQueue, SendJob{sv, destGid})
+			kv.logShardSender(false, shardId, newVersion, destGid, "Produced a job to send shard")
+			kv.shardToSendJobs = append(kv.shardToSendJobs, sendJob)
 		}
-		// 2. create shards that are previously not assigned
+		// 2. create empty shards that are previously not assigned, maintain the invariance
+		for _, shardId := range shardsToInitialize {
+			// make sure that previously it is not served
+			_, exists := kv.shardedStateMachines[shardId]
+			if exists {
+				kv.logShardReceiver(true, shardId, newVersion, 0, "Try to initialize a shard that is already in state machine")
+			}
+			kv.shardedStateMachines[shardId] = make(map[string]string)
+		}
+		// 3. install received shards to the state machine and add yet-to-be-received shards to job list
+		for _, shardId := range shardsToReceive {
+			sourceGid := kv.config.Shards[shardId]
+			// make sure that previously it is not served, maintain the invariance
+			_, exists := kv.shardedStateMachines[shardId]
+			if exists {
+				kv.logShardReceiver(true, shardId, newVersion, sourceGid, "Try to receive a shard that is already in the state machine")
+			}
+			// check if the shard has already been in the buffer
+			bufferedShardData, exists := kv.shardBuffer[ShardVersion{shardId, newVersion}]
+			if exists {
+				kv.logShardReceiver(false, shardId, newVersion, sourceGid, "Install the shard to state machine on applying IncrementConfig")
+				delete(kv.shardBuffer, ShardVersion{shardId, newVersion})
+				kv.shardedStateMachines[shardId] = bufferedShardData
+			} else {
+				// data not ready, create the installation job
+				kv.logShardReceiver(false, shardId, newVersion, sourceGid, "Create a install job, awaiting the receipt of the shard")
+				// check invariance: there should be at most 1 shardToInstall job for each shard.
+				// Because install job is created by delegation of a shard and deleted by either the shard getting installed or re-delegated to a new group before installation to the current group
+				prevVersion, alreadyExists := kv.shardToInstallJobs[shardId]
+				if alreadyExists {
+					kv.logShardReceiver(true, shardId, newVersion, sourceGid, "ERROR: Try to create a installJob but the shardId has been associated with a installJob with version %d", prevVersion)
+				}
+				kv.shardToInstallJobs[shardId] = newVersion
+			}
+		}
+		// replace the config safely
+		kv.config = operation.Config
 	}
 }
 
@@ -416,7 +475,7 @@ func (kv *ShardKV) configQueryIssuer() {
 		if latestConfig.Num == kv.getCurrentVersion()+1 {
 			// optionally, prevent client operations on the about-to-be-removed shards from entering the log
 			// because these log entries are after the configUpdate entry. They will not be applied anyway
-			_, shardsToSend, _, _, _ := CompareConfigs(kv.gid, kv.config, latestConfig)
+			_, shardsToSend, _, _ := CompareConfigs(kv.gid, kv.config, latestConfig)
 			for _, shard := range shardsToSend {
 				kv.precludedShards[shard] = true
 			}
@@ -557,21 +616,19 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 func (kv *ShardKV) getCurrentVersion() int {
 	return kv.config.Num
 }
-func CompareConfigs(gid int, oldConfig shardctrler.Config, newConfig shardctrler.Config) ([]int, []int, []int, []int, []int) {
+func CompareConfigs(gid int, oldConfig shardctrler.Config, newConfig shardctrler.Config) ([]int, []int, []int, []int) {
 	if gid == 0 {
 		panic("Gid in compare Configs should never be 0!")
 	}
 	oldShards := oldConfig.GetShardsManagedBy(gid)
 	newShards := newConfig.GetShardsManagedBy(gid)
-	var shardsToReceive, shardsToSend, noChangeShards, shardsToInitialize, shardsToDelete []int
+	var shardsToReceive, shardsToSend, noChangeShards, shardsToInitialize []int
 	for shard := range oldShards {
 		_, exists := newShards[shard]
 		if exists {
 			noChangeShards = append(noChangeShards, shard)
-		} else if newConfig.Shards[shard] != 0 { // will be assigned to another group
+		} else {
 			shardsToSend = append(shardsToSend, shard)
-		} else { // will not be assigned to any group
-			shardsToDelete = append(shardsToDelete, shard)
 		}
 	}
 	for shard := range newShards {
@@ -582,7 +639,7 @@ func CompareConfigs(gid int, oldConfig shardctrler.Config, newConfig shardctrler
 			shardsToInitialize = append(shardsToInitialize, shard)
 		}
 	}
-	return shardsToReceive, shardsToSend, noChangeShards, shardsToInitialize, shardsToDelete
+	return shardsToReceive, shardsToSend, noChangeShards, shardsToInitialize
 }
 
 // logging functions
