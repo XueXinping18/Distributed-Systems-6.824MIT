@@ -272,9 +272,13 @@ func (kv *ShardKV) isShardDuplicated(shard int, version int, sourceGid int) bool
 	}
 }
 
-// check if RPC context matched with RPC response
+// check if RPC context matched with RPC response, if response is nil then it might be IncrementConfig (because it has no response associated)
 func (context *RpcContext) isMatchedWithResponse() bool {
 	response := context.Response
+	if response == nil {
+		// there is no associated response
+		return false
+	}
 	if context.CommandId.Type != response.CommandId.Type {
 		return false
 	}
@@ -336,9 +340,6 @@ func (kv *ShardKV) HandleKVOperation(args *KVOperationArgs, reply *KVOperationRe
 	currentContext.replyCond.Wait()
 	delete(kv.rpcContexts, indexOrLeader)
 	response := currentContext.Response
-	if response == nil {
-		kv.logClientRPC(true, args.ClerkId, args.SeqNum, "ERROR: RPC handler woken up but the response is nil!")
-	}
 	if !currentContext.isMatchedWithResponse() {
 		// mismatch found, the log entry must have been cleaned up, client must retry
 		reply.Err = ErrLogEntryErased
@@ -380,7 +381,7 @@ func (kv *ShardKV) applyChannelObserver() {
 			}
 			rpcContext, ok := kv.rpcContexts[applyMsg.CommandIndex]
 			// reply if there is a matched RPC handler (i.e. the leader that talked to the client/shard sender is the current server)
-			if response == nil || ok {
+			if ok {
 				rpcContext.deliverResponseAndNotify(response)
 				kv.logClientRPC(false, response.ClerkId, response.SeqNum, "Notify the RPC handler with the reply message!")
 			}
