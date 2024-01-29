@@ -68,7 +68,9 @@ type KVOperationReply struct {
 
 type InstallShardArgs struct {
 	Version        int // the new configID i.e. all the changes on the shards before this configID have been reflected to the shards
-	Shards         map[int]map[string]string
+	Shard          int // shardId
+	Data           map[string]string
+	SourceGid      int
 	DuplicateTable map[int64]*RpcResponse // the duplication table so that one operation will not be executed in both group when configuration changes
 }
 type InstallShardReply struct {
