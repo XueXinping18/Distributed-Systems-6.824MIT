@@ -165,7 +165,7 @@ func (kv *KVServer) HandleKVOperation(args *KVOperationArgs, reply *KVOperationR
 	} else {
 		// matched correctly
 		reply.Value, reply.Err = response.Value, response.Err
-		kv.logRPC(false, args.ClerkId, args.SeqNum, "Assembled response matched with the RPC context, send back reply...")
+		kv.logRPC(false, args.ClerkId, args.SeqNum, "RPC Handler woken up and assembled response matched with the RPC context, send back reply...")
 		return
 	}
 }
