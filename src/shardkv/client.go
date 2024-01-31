@@ -119,6 +119,9 @@ func (ck *Clerk) KVOperation(args *KVOperationArgs) string {
 			case ErrWrongGroup:
 				ck.logRPC(false, seqNum, gid, serverId, "Client notified that the server no longer manages the shard, refresh the config and retry!")
 				refreshConfig = true
+			case ErrShardNotReady:
+				ck.logRPC(false, seqNum, gid, serverId, "Client notified that shard is not ready for the group, retry!")
+				refreshConfig = false
 			case ErrLogEntryErased:
 				ck.logRPC(false, seqNum, gid, serverId, "Client notified that log entry has been erased, retry!")
 				refreshConfig = false
@@ -142,6 +145,8 @@ func (ck *Clerk) KVOperation(args *KVOperationArgs) string {
 				// success
 				ck.logRPC(false, seqNum, gid, serverId, "The request returns successfully!")
 				done = true // break the loop
+			default:
+				ck.logRPC(true, seqNum, gid, serverId, "Unknown Err type: "+string(reply.Err))
 			}
 		}
 		count++
