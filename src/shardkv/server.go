@@ -122,6 +122,9 @@ type Op struct {
 	DuplicateTable map[int64]*RpcResponse // the duplication table so that one operation will not be executed in both group when configuration changes
 	// For update Configuration
 	Config shardctrler.Config
+	// For Garbage collection a finished job
+	// ShardId as in install shards
+	// Version used as the oldVersion in sendJob
 }
 
 type ShardKV struct {
@@ -300,6 +303,13 @@ func (context *RpcContext) isMatchedWithResponse() bool {
 func (kv *ShardKV) HandleKVOperation(args *KVOperationArgs, reply *KVOperationReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	targetGid := kv.config.Shards[key2shard(args.Key)]
+	// handling wrong group scenario
+	if kv.precludedShards[key2shard(args.Key)] || targetGid != kv.gid {
+		reply.Err = ErrWrongGroup
+		kv.logClientRPC(false, args.ClerkId, args.SeqNum, "Received command with shard %d and targetGid %d but server gid is %d", key2shard(args.Key), targetGid, kv.gid)
+		return
+	}
 	cache, ok := kv.duplicateTable[args.ClerkId]
 	// the command has just been executed, need to reply
 	if ok && cache.SeqNum == args.SeqNum {
@@ -430,7 +440,12 @@ func (kv *ShardKV) validateAndApply(operation *Op) *RpcResponse {
 		response := kv.validateAndApplyInstallShard(operation)
 		return response
 	}
-	// Scenario 3: clientOperation
+	// Scenario 3: finishSendJob
+	if operation.Type == FINISHSENDJOB {
+		kv.validateAndApplyFinishSendJob(operation)
+		return nil // finish send job does not have associated RPC handler
+	}
+	// Scenario 4: clientOperation
 	cachedEntry, ok := kv.duplicateTable[operation.ClerkId]
 	// not outdated or duplicated
 	var response *RpcResponse
@@ -460,6 +475,18 @@ func (kv *ShardKV) validateAndApply(operation *Op) *RpcResponse {
 		}
 	}
 	return response
+}
+
+// for finished sendJobs, set the label as finished
+func (kv *ShardKV) validateAndApplyFinishSendJob(operation *Op) {
+	oldSV := ShardVersion{operation.ShardId, operation.Version}
+	sendJob, ok := kv.shardToSendJobs[oldSV]
+	if ok && sendJob.Status != Finished {
+		kv.logService(false, "sendJob with shard %d and new version %d is labeled as finished!", sendJob.Shard, sendJob.NewVersion)
+		sendJob.Status = Finished
+	} else {
+		kv.logService(false, "Try to label as finished sendJob with shard %d and old version %d but this has already been done", operation.ShardId, operation.Version)
+	}
 }
 
 // check duplicates and Apply the operation to increment Config
@@ -671,6 +698,16 @@ func (kv *ShardKV) applyClientOperation(operation *Op) *RpcResponse {
 		},
 	}
 	shardID := key2shard(operation.Key)
+	// check if the shard the command is operated on is managed by the current config
+	if kv.gid != kv.config.Shards[shardID] {
+		response.Err = ErrWrongGroup
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Operation replicated in log but not executed because the group changed!")
+		// check invariance: the stateMachine must not possess the data that the current config does not manage
+		if _, exists := kv.shardedStateMachines[shardID]; exists {
+			kv.logClientRPC(true, operation.ClerkId, operation.SeqNum, "Shard %d not served in the group %d for config %d appear in state machine", shardID, kv.gid, kv.getCurrentVersion())
+		}
+		return response
+	}
 	switch operation.Type {
 	case GET:
 		val, ok := kv.shardedStateMachines[shardID][operation.Key]
@@ -780,6 +817,7 @@ func (kv *ShardKV) configQueryIssuer() {
 // Periodically send shards to other group and waiting for reply
 // on receiving reply of OK, the corresponding sendJob will be removed in a replicated fashion (needs to reach consensus)
 func (kv *ShardKV) sendShardScheduler() {
+	kv.logService(false, "Start to periodically check if some shards are ready to be sent...")
 	for !kv.killed() {
 		time.Sleep(time.Duration(SendShardMillis) * time.Millisecond)
 		kv.mu.Lock()
@@ -795,7 +833,7 @@ func (kv *ShardKV) sendShardScheduler() {
 		for _, sendJob := range kv.shardToSendJobs {
 			if sendJob.Status == NotStarted {
 				sendJob.Status = Ongoing
-				go kv.sendShard(sendJob)
+				go kv.sendShardIfAvailable(sendJob)
 			}
 		}
 		kv.mu.Unlock()
@@ -806,14 +844,61 @@ func (kv *ShardKV) sendShardScheduler() {
 // if OK is replied by any of the server in the group, set the sendJob status as finished through replication.
 // if none of them replied OK, finished by set the status as NotStarted if not Finished.
 // if it fails to commit the finish of the job, set the status as NotStarted and return (causing duplication but maintain correctness)
-func (kv *ShardKV) sendShard(sendJob *SendJobContext) {
-	kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Start to send a shard!")
+func (kv *ShardKV) sendShardIfAvailable(sendJob *SendJobContext) {
+	kv.mu.Lock()
+	kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Attempt to send a shard!")
+	// TODO: does duplicate Table need to copy
+	// data of that version is available
 	for _, serverName := range sendJob.DestServers {
+		shardData, available := kv.shardBuffer[ShardVersion{sendJob.Shard, sendJob.NewVersion}]
+		if !available {
+			kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "The shard data is not in buffer so can't be sent!")
+			sendJob.Status = NotStarted
+			kv.mu.Unlock()
+			return
+		}
 		serverEnd := kv.makeEnd(serverName)
-		args := &InstallShardArgs{}
-		reply := &InstallShardReply{}
+		args := &InstallShardArgs{
+			Shard:          sendJob.Shard,
+			Version:        sendJob.NewVersion,
+			Data:           shardData,
+			SourceGid:      kv.gid,
+			DuplicateTable: kv.duplicateTable,
+		}
+		reply := new(InstallShardReply)
+		kv.mu.Unlock()
+		kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Start the RPC to send the shard to "+serverName)
 		ok := serverEnd.Call("ShardKV.HandleInstallShard", args, reply)
+		// it might be the case that the job is finished during waiting for reply.
+		kv.mu.Lock()
+		if sendJob.Status == Finished {
+			kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "SendJob is labeled finished during sending of the shard, ignore the reply")
+			return
+		}
+		if !ok {
+			kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Lost the reply for sending shard to "+serverName+", retry another server")
+		} else if reply.Err != OK {
+			kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Shard sent is rejected with error "+string(reply.Err))
+		} else {
+			op := Op{
+				Type:    FINISHSENDJOB,
+				ShardId: sendJob.Shard,
+				Version: sendJob.OldVersion,
+			}
+			kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Received OK, Try to delegate FinishSendJob to the Raft library")
+			indexOrLeader, term, success := kv.rf.Start(op)
+			if !success {
+				kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Fail to add FinishSendJob to log because the server is "+
+					"not leader in term %d, with the leader %d", term, indexOrLeader)
+			} else {
+				kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "FinishSendJob added to the log at index %d!", indexOrLeader)
+			}
+		}
 	}
+	if sendJob.Status != Finished {
+		sendJob.Status = NotStarted
+	}
+	kv.mu.Unlock()
 }
 
 // Periodically clean the garbage to free some memory
@@ -824,14 +909,14 @@ func (kv *ShardKV) garbageCollector() {
 	for !kv.killed() {
 		time.Sleep(time.Duration(GarbageCollectMillis) * time.Millisecond)
 		kv.mu.Lock()
-		for sv, sendJob := range kv.shardToSendJobs {
+		for oldSV, sendJob := range kv.shardToSendJobs {
 			if sendJob.Status == Finished {
-				kv.logService(false, "GCed the shard with id %d and version %d", sendJob.Shard, sendJob.NewVersion)
-				key := ShardVersion{sendJob.Shard, sendJob.NewVersion}
-				if _, ok := kv.shardBuffer[key]; ok {
-					delete(kv.shardBuffer, key)
+				kv.logService(false, "Just GCed the shard with id %d and version %d", sendJob.Shard, sendJob.NewVersion)
+				newSV := ShardVersion{sendJob.Shard, sendJob.NewVersion}
+				if _, ok := kv.shardBuffer[newSV]; ok {
+					delete(kv.shardBuffer, newSV)
 				}
-				delete(kv.shardToSendJobs, sv)
+				delete(kv.shardToSendJobs, oldSV)
 			}
 		}
 		kv.mu.Unlock()
@@ -862,6 +947,18 @@ func (kv *ShardKV) serializeSnapshot() []byte {
 	if encoder.Encode(kv.lastExecutedIndex) != nil {
 		kv.logService(true, "Fail to encode the last executed index!")
 	}
+	if encoder.Encode(kv.shardBuffer) != nil {
+		kv.logService(true, "Fail to encode the shard buffer!")
+	}
+	if encoder.Encode(kv.config) != nil {
+		kv.logService(true, "Fail to encode the configuration!")
+	}
+	if encoder.Encode(kv.shardToSendJobs) != nil {
+		kv.logService(true, "Fail to encode the list of send jobs!")
+	}
+	if encoder.Encode(kv.shardToInstallJobs) != nil {
+		kv.logService(true, "Fail to encode the list of install jobs!")
+	}
 	return writeBuffer.Bytes()
 }
 
@@ -876,6 +973,10 @@ func (kv *ShardKV) deserializeSnapshot(data []byte) {
 	var shardedStateMachines map[int]map[string]string
 	var duplicateTable map[int64]*RpcResponse
 	var lastExecutedIndex int
+	var shardBuffer map[ShardVersion]map[string]string
+	var configuration shardctrler.Config
+	var shardToSendJobs map[ShardVersion]*SendJobContext
+	var shardToInstallJobs map[int]int
 	if decoder.Decode(&shardedStateMachines) != nil {
 		kv.logService(false, "Failed to read state machine from snapshot bytes!")
 	}
@@ -885,9 +986,25 @@ func (kv *ShardKV) deserializeSnapshot(data []byte) {
 	if decoder.Decode(&lastExecutedIndex) != nil {
 		kv.logService(false, "Failed to read last executed index from snapshot bytes!")
 	}
+	if decoder.Decode(&shardBuffer) != nil {
+		kv.logService(false, "Failed to read shardBuffer from snapshot bytes!")
+	}
+	if decoder.Decode(&configuration) != nil {
+		kv.logService(false, "Failed to read config from snapshot bytes!")
+	}
+	if decoder.Decode(&shardToSendJobs) != nil {
+		kv.logService(false, "Failed to read the list of SendJobs from snapshot bytes!")
+	}
+	if decoder.Decode(&shardToInstallJobs) != nil {
+		kv.logService(false, "Failed to read the list of InstallJobs from snapshot bytes!")
+	}
 	kv.shardedStateMachines = shardedStateMachines
 	kv.duplicateTable = duplicateTable
 	kv.lastExecutedIndex = lastExecutedIndex
+	kv.shardBuffer = shardBuffer
+	kv.config = configuration
+	kv.shardToSendJobs = shardToSendJobs
+	kv.shardToInstallJobs = shardToInstallJobs
 }
 
 // servers[] contains the ports of the servers in this group.
@@ -938,6 +1055,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		lastExecutedIndex:    0,
 		snapshotThreshold:    int(RaftStateLengthRatio * float64(maxraftstate)),
 		config:               *shardctrler.MakeEmptyConfig(),
+		precludedShards:      make(map[int]bool),
+		shardToSendJobs:      make(map[ShardVersion]*SendJobContext),
+		shardToInstallJobs:   make(map[int]int),
 	}
 	kv.mck = shardctrler.MakeClerk(controllers)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -949,6 +1069,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// run background thread
 	go kv.applyChannelObserver()
 	go kv.staleRpcContextDetector()
+	go kv.configQueryIssuer()
+	go kv.sendShardScheduler()
+	go kv.garbageCollector()
 	return kv
 }
 

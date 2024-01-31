@@ -33,6 +33,7 @@ const (
 	APPEND
 	INSTALLSHARD
 	INCREMENTCONFIG
+	FINISHSENDJOB
 )
 
 type Err string

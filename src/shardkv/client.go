@@ -61,11 +61,11 @@ func MakeClerk(controllers []*labrpc.ClientEnd, makeEnd func(string) *labrpc.Cli
 //
 // This function might block and fetch config if the configuration no server available for the key
 // The function does not guarantee that the server selected is the leader.
-func (ck *Clerk) selectServer(args *KVOperationArgs) (*labrpc.ClientEnd, int, int) {
+func (ck *Clerk) selectServer(args *KVOperationArgs, mustRefreshConfig bool) (*labrpc.ClientEnd, int, int) {
 	shard := key2shard(args.Key)
 	gid := ck.config.Shards[shard]
 	servers := ck.config.Groups[gid]
-	for gid == 0 || len(servers) == 0 {
+	for gid == 0 || len(servers) == 0 || mustRefreshConfig {
 		time.Sleep(100 * time.Millisecond)
 		ck.config = ck.sm.Query(-1) // fetch the newest config
 		gid = ck.config.Shards[shard]
@@ -95,13 +95,14 @@ func (ck *Clerk) KVOperation(args *KVOperationArgs) string {
 	var reply *KVOperationReply
 	seqNum := args.SeqNum
 	count := 0
+	refreshConfig := false
 	for done := false; !done; {
 		ck.logClerk(false, "The number of attempt to send the operation for the SeqNum %d is %d. Do the next attempt!",
 			seqNum, count)
 		// reset reply struct for every retry
 		reply = new(KVOperationReply)
 		// select server according to config
-		serverEnd, gid, serverId := ck.selectServer(args)
+		serverEnd, gid, serverId := ck.selectServer(args, refreshConfig)
 		// Doing RPC to the server.
 		// Note that serverId in client side and server side is different for the same server
 		ok := serverEnd.Call("ShardKV.HandleKVOperation", args, reply)
@@ -111,16 +112,23 @@ func (ck *Clerk) KVOperation(args *KVOperationArgs) string {
 			// message lost, retry with a random server
 			ck.logRPC(false, seqNum, gid, serverId, "Message Lost in traffic (either request or response)")
 			ck.preferredServer = -1
+			refreshConfig = true
 		} else {
 			// decide what action to do according to error term, validate invariance
 			switch reply.Err {
+			case ErrWrongGroup:
+				ck.logRPC(false, seqNum, gid, serverId, "Client notified that the server no longer manages the shard, refresh the config and retry!")
+				refreshConfig = true
 			case ErrLogEntryErased:
 				ck.logRPC(false, seqNum, gid, serverId, "Client notified that log entry has been erased, retry!")
+				refreshConfig = false
 				ck.preferredServer = -1
 			case ErrWrongLeader:
 				ck.logRPC(false, seqNum, gid, serverId, "Client notified that the server is not leader, retry another server!")
+				refreshConfig = false
 				ck.preferredServer = -1
 			case ErrNoKey:
+				refreshConfig = false
 				ck.preferredServer = serverId
 				// success
 				if reply.Value != "" || args.Type != GET {
@@ -129,6 +137,7 @@ func (ck *Clerk) KVOperation(args *KVOperationArgs) string {
 				ck.logRPC(false, seqNum, gid, serverId, "The Get request with key not existed in the state machine!")
 				done = true // break the loop
 			case OK:
+				refreshConfig = false
 				ck.preferredServer = serverId
 				// success
 				ck.logRPC(false, seqNum, gid, serverId, "The request returns successfully!")
