@@ -115,16 +115,13 @@ type Op struct {
 	Key     string
 	Value   string // not used if the type is GET
 	// For install shards
-	Version        int // the new configID i.e. all the changes on the shards before this configID have been reflected to the shards
-	ShardId        int
+	Version        int // also for FinishSendJob, the new configID i.e. all the changes on the shards before this configID have been reflected to the shards
+	ShardId        int // also for FinishSendJob
 	ShardData      map[string]string
 	SourceGid      int
 	DuplicateTable map[int64]*RpcResponse // the duplication table so that one operation will not be executed in both group when configuration changes
 	// For update Configuration
 	Config shardctrler.Config
-	// For Garbage collection a finished job
-	// ShardId as in install shards
-	// Version used as the oldVersion in sendJob
 }
 
 type ShardKV struct {
@@ -1037,9 +1034,12 @@ func (kv *ShardKV) deserializeSnapshot(data []byte) {
 // for any long-running work.
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int,
 	controllers []*labrpc.ClientEnd, makeEndFunc func(string) *labrpc.ClientEnd) *ShardKV {
-	labgob.Register(Op{}) // as the command stored in logs
-	labgob.Register(shardctrler.Config{})
-	labgob.Register(RpcResponse{}) // as the response cached in duplicate table
+	labgob.Register(Op{})                      // as the command stored in logs
+	labgob.Register(shardctrler.Config{})      // as in log
+	labgob.Register(RpcResponse{})             // as the response cached in duplicate table
+	labgob.Register(CommandUniqueIdentifier{}) // as in RPC messages
+	labgob.Register(ShardVersion{})            // in snapshot
+	labgob.Register(SendJobContext{})          // in snapshot
 	kv := &ShardKV{
 		me:                   me,
 		maxRaftState:         maxraftstate,
