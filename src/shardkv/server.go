@@ -18,6 +18,7 @@ const RaftStateLengthRatio float64 = 0.8  // the threshold above which the raft 
 const StaleDetectorSleepMillis int = 1500 // how long to check if the term deviated from the term a command is appended in log
 const QueryConfigMillis int = 80          // periodically issue query to shard controller for latest config
 const SendShardMillis int = 150           // periodically scan the sendJob list and scheduling to send shards if data available
+const GarbageCollectMillis int = 200      // periodically trigger the garbage collector to delete buffered shards that have been installed to their new owner
 
 // CommandUniqueIdentifier encapsulated how RPC context and RPC response is matched
 type CommandUniqueIdentifier struct {
@@ -54,12 +55,22 @@ type ShardVersion struct {
 	Version int
 }
 
+type JobState int
+
+const (
+	NotStarted JobState = iota
+	Ongoing
+	Finished
+)
+
 // used for shard sender to store info about unfinished send jobs
 type SendJobContext struct {
-	Shard      int
-	OldVersion int // the version that the shard has on the shardBuffer.
-	NewVersion int // the version of the shard before which updates are reflected on the data, might be mismatched
-	DestGID    int
+	Shard       int
+	OldVersion  int // the version that the shard has on the shardBuffer.
+	NewVersion  int // the version of the shard before which updates are reflected on the data, might be mismatched
+	DestGID     int
+	DestServers []string
+	Status      JobState
 }
 
 // The constructor for RpcContext, mainly for bind the conditional variable to the mutex of the ShardKV
@@ -133,12 +144,11 @@ type ShardKV struct {
 	shardedStateMachines map[int]map[string]string // the in-memory key-value stateMachine, they are partitioned by shardID, done so as the unit of data deletion
 	config               shardctrler.Config        // the config the shard is currently serving
 	// once a configuration change observed in controller, the group stop serve some shards
-	precludedShards map[int]bool // optional, used when a new incrementConfig is appended to log but yet to be applied. Prevent client operations on the to-be-removed shards from entering the log after the updateConfig log
-	// isNextConfigInLog    bool                               // optional, set to true after a new config appended to log but not applied yet. Prevent repeatedly enter into log for the same config
-	shardBuffer map[ShardVersion]map[string]string // a layered buffer to store shards that are not for the current config
+	precludedShards map[int]bool                       // optional, used when a new incrementConfig is appended to log but yet to be applied. Prevent client operations on the to-be-removed shards from entering the log after the updateConfig log
+	shardBuffer     map[ShardVersion]map[string]string // a layered buffer to store shards that are not for the current config
 	// the first level is configID AND shardID, the last level is data for the shard that reflected all the changes before configID
-	shardToSendJobs    map[ShardVersion]SendJobContext // the set of unfinished send jobs, key to be the expected received version and shardId
-	shardToInstallJobs map[int]int                     // the set of unfinished jobs to install shards to the state machine after receipt. key: shardId, value: version expected
+	shardToSendJobs    map[ShardVersion]*SendJobContext // the set of unfinished send jobs, key to be the expected received version and shardId
+	shardToInstallJobs map[int]int                      // the set of unfinished jobs to install shards to the state machine after receipt. key: shardId, value: version expected
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -193,9 +203,6 @@ func (kv *ShardKV) HandleInstallShard(args *InstallShardArgs, reply *InstallShar
 	// woke up after the response is generated
 	delete(kv.rpcContexts, indexOrLeader)
 	response := currentContext.Response
-	if response == nil {
-		kv.logShardReceiver(false, args.Shard, args.Version, args.SourceGid, "ERROR: RPC handler woken up but the response is nil!")
-	}
 
 	if !currentContext.isMatchedWithResponse() {
 		// same log index but not same command
@@ -276,7 +283,7 @@ func (kv *ShardKV) isShardDuplicated(shard int, version int, sourceGid int) bool
 func (context *RpcContext) isMatchedWithResponse() bool {
 	response := context.Response
 	if response == nil {
-		// there is no associated response
+		// there is no associated response, it could happen when a IncrementConfig has the same index with an operation with RPC context
 		return false
 	}
 	if context.CommandId.Type != response.CommandId.Type {
@@ -413,10 +420,17 @@ func (kv *ShardKV) validateAndApply(operation *Op) *RpcResponse {
 	if operation == nil {
 		kv.logService(true, "ERROR: The operation to execute is a nil pointer!")
 	}
+	// Scenario 1: incrementConfig
 	if operation.Type == INCREMENTCONFIG {
-		kv.applyIncrementConfig(operation)
-		return nil
+		kv.validateAndApplyIncrementConfig(operation)
+		return nil // IncrementConfig does not have associated RPC handler
 	}
+	// Scenario 2: installShard
+	if operation.Type == INSTALLSHARD {
+		response := kv.validateAndApplyInstallShard(operation)
+		return response
+	}
+	// Scenario 3: clientOperation
 	cachedEntry, ok := kv.duplicateTable[operation.ClerkId]
 	// not outdated or duplicated
 	var response *RpcResponse
@@ -441,8 +455,6 @@ func (kv *ShardKV) validateAndApply(operation *Op) *RpcResponse {
 				Type:    operation.Type,
 				ClerkId: operation.ClerkId,
 				SeqNum:  operation.SeqNum,
-				ShardId: operation.ShardId,
-				Version: operation.Version,
 			},
 			Err: OK,
 		}
@@ -450,8 +462,8 @@ func (kv *ShardKV) validateAndApply(operation *Op) *RpcResponse {
 	return response
 }
 
-// Apply the operation to increment Config
-func (kv *ShardKV) applyIncrementConfig(operation *Op) {
+// check duplicates and Apply the operation to increment Config
+func (kv *ShardKV) validateAndApplyIncrementConfig(operation *Op) {
 	// it should be impossible to have jump or going backward in config updates when applying Increment Config
 	newVersion := operation.Config.Num
 	if operation.Config.Num > 1+kv.getCurrentVersion() || operation.Config.Num < kv.getCurrentVersion() {
@@ -482,10 +494,11 @@ func (kv *ShardKV) applyIncrementConfig(operation *Op) {
 				delete(kv.shardToInstallJobs, shardId)
 				// create a sendJob reflecting the equivalence of old version shard and new version shard
 				sendJob = SendJobContext{
-					Shard:      shardId,
-					OldVersion: oldVersionExpected,
-					NewVersion: newVersion,
-					DestGID:    destGid,
+					Shard:       shardId,
+					OldVersion:  oldVersionExpected,
+					NewVersion:  newVersion,
+					DestGID:     destGid,
+					DestServers: kv.getServerNames(destGid),
 				}
 			} else {
 				// shard already in the stateMachine
@@ -495,14 +508,15 @@ func (kv *ShardKV) applyIncrementConfig(operation *Op) {
 				kv.shardBuffer[ShardVersion{shardId, newVersion}] = shardData
 				// create the job to job-list for asynchronously sending
 				sendJob = SendJobContext{
-					Shard:      shardId,
-					OldVersion: newVersion,
-					NewVersion: newVersion,
-					DestGID:    destGid,
+					Shard:       shardId,
+					OldVersion:  newVersion,
+					NewVersion:  newVersion,
+					DestGID:     destGid,
+					DestServers: kv.getServerNames(destGid),
 				}
 			}
 			kv.logShardSender(false, shardId, newVersion, destGid, "Produced a job to send shard")
-			kv.shardToSendJobs[ShardVersion{sendJob.Shard, sendJob.OldVersion}] = sendJob
+			kv.shardToSendJobs[ShardVersion{sendJob.Shard, sendJob.OldVersion}] = &sendJob
 		}
 		// 2. create empty shards that are previously not assigned, maintain the invariance
 		for _, shardId := range shardsToInitialize {
@@ -541,6 +555,104 @@ func (kv *ShardKV) applyIncrementConfig(operation *Op) {
 		}
 		// replace the config safely
 		kv.config = operation.Config
+	}
+}
+
+// Check duplicates and apply the installation of a shard
+func (kv *ShardKV) validateAndApplyInstallShard(operation *Op) *RpcResponse {
+	if operation == nil {
+		kv.logService(true, "ERROR: The operation to execute is a nil pointer!")
+	}
+	// for duplicated request, simply reply OK
+	if kv.isShardDuplicated(operation.ShardId, operation.Version, operation.SourceGid) {
+		kv.logShardReceiver(false, operation.ShardId, operation.Version, operation.SourceGid, "An installShard about to be executed is found duplicated and simply reply OK")
+		return &RpcResponse{
+			CommandId: CommandUniqueIdentifier{
+				Type:    INSTALLSHARD,
+				ShardId: operation.ShardId,
+				Version: operation.Version,
+			},
+			Err: OK,
+		}
+	}
+	return kv.applyInstallShard(operation)
+}
+
+// apply the installation of a shard
+func (kv *ShardKV) applyInstallShard(operation *Op) *RpcResponse {
+	// always updates the duplicated table
+	for clerkId, response := range operation.DuplicateTable {
+		seqNum := response.SeqNum
+		prevDupResponse, ok := kv.duplicateTable[clerkId]
+		if !ok || seqNum > prevDupResponse.SeqNum {
+			kv.duplicateTable[clerkId] = response
+			// for logging purpose, -1 represents no previous record in dup table for the clerk
+			oldSeqNum := -1
+			if ok {
+				oldSeqNum = prevDupResponse.SeqNum
+			}
+			kv.logShardReceiver(false, operation.ShardId, operation.Version, operation.SourceGid, "Duplicated table with clerkID "+base64Prefix(clerkId)+" has been updated with SeqNum from %d to %d", oldSeqNum, seqNum)
+		}
+	}
+	// scenario 1: arrived earlier than the config change, simply add into the buffer for later use
+	if operation.Version > kv.getCurrentVersion() {
+		kv.shardBuffer[ShardVersion{operation.ShardId, operation.Version}] = operation.ShardData
+		kv.logShardReceiver(false, operation.ShardId, operation.Version, operation.SourceGid, "Install shard with version %d larger than current version %d", operation.Version, kv.getCurrentVersion())
+		return &RpcResponse{
+			CommandId: CommandUniqueIdentifier{
+				Type:    INSTALLSHARD,
+				ShardId: operation.ShardId,
+				Version: operation.Version,
+			},
+			Err: OK,
+		}
+	}
+	// scenario 2: arrived after the config change, check job lists
+	expectedInstallVersion, installJobExists := kv.shardToInstallJobs[operation.ShardId]
+	sendJobContext, sendJobExists := kv.shardToSendJobs[ShardVersion{operation.ShardId, operation.Version}]
+	// check invariant: one oldVersion can't be simultaneously needed for send job and install job
+	if sendJobExists && installJobExists && expectedInstallVersion == operation.Version {
+		kv.logShardReceiver(true, operation.ShardId, operation.Version, operation.SourceGid, "ERROR: a shard & version is expected to be installed and resend simultaneously!")
+	}
+	// check send job
+	if sendJobExists {
+		// job exists, install the data to buffer with newVersion, note that the sending of data is done async and the send job will be removed after executed
+		newVersion := sendJobContext.NewVersion
+		kv.shardBuffer[ShardVersion{operation.ShardId, newVersion}] = operation.ShardData
+		kv.logShardReceiver(false, operation.ShardId, operation.Version, operation.SourceGid, "Install shard that the group is waiting to resend with old version %d and new version %d", operation.Version, newVersion)
+		return &RpcResponse{
+			CommandId: CommandUniqueIdentifier{
+				Type:    INSTALLSHARD,
+				ShardId: operation.ShardId,
+				Version: operation.Version,
+			},
+			Err: OK,
+		}
+	}
+	// check installation job: remove the job and install to state machine
+	if installJobExists && expectedInstallVersion == operation.Version {
+		// check invariant: when installing shard, there is no existed shard
+		if _, ok := kv.shardedStateMachines[operation.ShardId]; ok {
+			kv.logShardReceiver(true, operation.ShardId, operation.Version, operation.SourceGid, "ERROR: On installing a shard, conflicting shard is being served in the state machine")
+		}
+		kv.shardedStateMachines[operation.ShardId] = operation.ShardData
+		delete(kv.shardToInstallJobs, operation.ShardId)
+		kv.logShardReceiver(false, operation.ShardId, operation.Version, operation.SourceGid, "Install shard to state machine on receipt, current config ID %d", kv.getCurrentVersion())
+		return &RpcResponse{
+			CommandId: CommandUniqueIdentifier{
+				Type:    INSTALLSHARD,
+				ShardId: operation.ShardId,
+				Version: operation.Version,
+			},
+			Err: OK,
+		}
+	} else if !installJobExists {
+		kv.logShardReceiver(true, operation.ShardId, operation.Version, operation.SourceGid, "ERROR: On installing a shard, no job exists when install job or send job is expected!")
+		return nil
+	} else {
+		kv.logShardReceiver(true, operation.ShardId, operation.Version, operation.SourceGid, "ERROR: On installing a shard, the expected install version is %d while provided version is %d",
+			expectedInstallVersion, operation.Version)
+		return nil
 	}
 }
 
@@ -665,6 +777,67 @@ func (kv *ShardKV) configQueryIssuer() {
 	}
 }
 
+// Periodically send shards to other group and waiting for reply
+// on receiving reply of OK, the corresponding sendJob will be removed in a replicated fashion (needs to reach consensus)
+func (kv *ShardKV) sendShardScheduler() {
+	for !kv.killed() {
+		time.Sleep(time.Duration(SendShardMillis) * time.Millisecond)
+		kv.mu.Lock()
+		// Optional: non-leader just sleep.
+		if _, isLeader := kv.rf.GetState(); !isLeader {
+			kv.mu.Unlock()
+			continue
+		}
+		// don't have to worry if the shard sender is leader or not.
+		// As the sendJob is created on the executing of config change
+		// and the commit of config change is replicated in all replica with total order
+		// i.e. the same sendJob executed by either leader or follower will send exactly the same shard
+		for _, sendJob := range kv.shardToSendJobs {
+			if sendJob.Status == NotStarted {
+				sendJob.Status = Ongoing
+				go kv.sendShard(sendJob)
+			}
+		}
+		kv.mu.Unlock()
+	}
+}
+
+// attempt to send shard to each server in a group (so that we don't have to maintain the leader for each group)
+// if OK is replied by any of the server in the group, set the sendJob status as finished through replication.
+// if none of them replied OK, finished by set the status as NotStarted if not Finished.
+// if it fails to commit the finish of the job, set the status as NotStarted and return (causing duplication but maintain correctness)
+func (kv *ShardKV) sendShard(sendJob *SendJobContext) {
+	kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Start to send a shard!")
+	for _, serverName := range sendJob.DestServers {
+		serverEnd := kv.makeEnd(serverName)
+		args := &InstallShardArgs{}
+		reply := &InstallShardReply{}
+		ok := serverEnd.Call("ShardKV.HandleInstallShard", args, reply)
+	}
+}
+
+// Periodically clean the garbage to free some memory
+func (kv *ShardKV) garbageCollector() {
+	// In my implementation, the versioned shard and the send job will be removed
+	// after receiving the reply of successful installation from the other group
+	kv.logService(false, "Start to periodically remove the versioned shards on buffer that has already been sent to the other group...")
+	for !kv.killed() {
+		time.Sleep(time.Duration(GarbageCollectMillis) * time.Millisecond)
+		kv.mu.Lock()
+		for sv, sendJob := range kv.shardToSendJobs {
+			if sendJob.Status == Finished {
+				kv.logService(false, "GCed the shard with id %d and version %d", sendJob.Shard, sendJob.NewVersion)
+				key := ShardVersion{sendJob.Shard, sendJob.NewVersion}
+				if _, ok := kv.shardBuffer[key]; ok {
+					delete(kv.shardBuffer, key)
+				}
+				delete(kv.shardToSendJobs, sv)
+			}
+		}
+		kv.mu.Unlock()
+	}
+}
+
 // after each time the stateMachine executed a new command, check if the size of the log has grown too large and
 // take snapshot if so.
 func (kv *ShardKV) shouldTakeSnapshot() bool {
@@ -772,10 +945,25 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// load states from persisted snapshot
 	kv.deserializeSnapshot(kv.rf.ReadSnapshot())
+	kv.cleanStatesPostRecoverFromPersist()
 	// run background thread
 	go kv.applyChannelObserver()
 	go kv.staleRpcContextDetector()
 	return kv
+}
+
+// perform necessary field cleansing after restore states from persistent states
+func (kv *ShardKV) cleanStatesPostRecoverFromPersist() {
+	// switch all ongoing send job to not-started so that they can be started again
+	defer kv.mu.Unlock()
+	kv.mu.Lock()
+	// the state change between NotStarted and Ongoing is not replicated while change to Finished is replicated
+	// Ongoing is just a transient state to avoid repeatedly send same shards before reply received
+	for _, sendJob := range kv.shardToSendJobs {
+		if sendJob.Status == Ongoing {
+			sendJob.Status = NotStarted
+		}
+	}
 }
 
 // utility functions
@@ -806,6 +994,9 @@ func CompareConfigs(gid int, oldConfig shardctrler.Config, newConfig shardctrler
 		}
 	}
 	return shardsToReceive, shardsToSend, noChangeShards, shardsToInitialize
+}
+func (kv *ShardKV) getServerNames(gid int) []string {
+	return kv.config.Groups[gid]
 }
 
 // logging functions
