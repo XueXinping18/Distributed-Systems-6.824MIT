@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 )
 
-// used to control whether or not print debugging info
+// used to control whether print debugging info
 const ShardKVDebug = false
 
 // used to shorten the uid of a client for logging
