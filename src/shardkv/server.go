@@ -18,7 +18,6 @@ const RaftStateLengthRatio float64 = 0.8  // the threshold above which the raft 
 const StaleDetectorSleepMillis int = 1500 // how long to check if the term deviated from the term a command is appended in log
 const QueryConfigMillis int = 80          // periodically issue query to shard controller for latest config
 const SendShardMillis int = 150           // periodically scan the sendJob list and scheduling to send shards if data available
-const GarbageCollectMillis int = 200      // periodically trigger the garbage collector to delete buffered shards that have been installed to their new owner
 
 // CommandUniqueIdentifier encapsulated how RPC context and RPC response is matched
 type CommandUniqueIdentifier struct {
@@ -207,11 +206,11 @@ func (kv *ShardKV) HandleInstallShard(args *InstallShardArgs, reply *InstallShar
 	if !currentContext.isMatchedWithResponse() {
 		// same log index but not same command
 		reply.Err = ErrLogEntryErased
-		kv.logShardReceiver(false, args.Shard, args.Version, args.SourceGid, "RPC Handler woken up but the command is not as it previously sent! The LogEntry must have been erased")
+		kv.logShardReceiver(false, args.Shard, args.Version, args.SourceGid, "RPC Handler woken up but the command is not as it previously sent! ErrLogEntryErased!")
 	} else {
 		// matched correctly
 		reply.Err = response.Err
-		kv.logShardReceiver(false, args.Shard, args.Version, args.SourceGid, "RPC Handler waken up with assembled response matched with the RPC context, send back reply...")
+		kv.logShardReceiver(false, args.Shard, args.Version, args.SourceGid, "RPC Handler waken up with assembled response matched with the RPC context, nice")
 	}
 	return
 }
@@ -437,36 +436,38 @@ func (kv *ShardKV) validateAndApply(operation *Op) *RpcResponse {
 		response := kv.validateAndApplyInstallShard(operation)
 		return response
 	}
-	// Scenario 3: finishSendJob
-	if operation.Type == FINISHSENDJOB {
-		kv.validateAndApplyFinishSendJob(operation)
-		return nil // finish send job does not have associated RPC handler
+	// Scenario 3: garbageCollect
+	if operation.Type == GARBAGECOLLECT {
+		kv.validateAndApplyGC(operation)
+		return nil // finishing send job does not have associated RPC handler
 	}
 	// Scenario 4: clientOperation
 	response := kv.validateAndApplyClientOperation(operation)
 	return response
 }
 
-// for finished sendJobs, set the label as finished
-func (kv *ShardKV) validateAndApplyFinishSendJob(operation *Op) {
+// for finished sendJobs, garbage collect the shard and the send job
+func (kv *ShardKV) validateAndApplyGC(operation *Op) {
 	oldSV := ShardVersion{operation.ShardId, operation.Version}
 	sendJob, ok := kv.shardToSendJobs[oldSV]
-	if ok && sendJob.Status != Finished {
-		kv.logService(false, "sendJob with shard %d and new version %d is labeled as finished!", sendJob.Shard, sendJob.NewVersion)
+	if ok {
+		kv.logService(false, "sendJob with shard %d and new version %d is ready to be GCed!", sendJob.Shard, sendJob.NewVersion)
 		sendJob.Status = Finished
+		// instead of using background thread to delete the shard later, we delete the shard once the consensus is reached
+		newSV := ShardVersion{sendJob.Shard, sendJob.NewVersion}
+		delete(kv.shardToSendJobs, oldSV)
+		delete(kv.shardBuffer, newSV)
 	} else {
-		kv.logService(false, "Try to label as finished sendJob with shard %d and old version %d but this has already been done", operation.ShardId, operation.Version)
+		kv.logService(false, "Try to delete sendJob and associated shard with shard %d and old version %d but this has already been done", operation.ShardId, operation.Version)
 	}
 }
 
 // check duplicates and Apply the operation to increment Config
 func (kv *ShardKV) validateAndApplyIncrementConfig(operation *Op) {
-	// it should be impossible to have jump or going backward in config updates when applying Increment Config
+	// Duplicate detection: ignore the increment Config that has ConfigNum different from current config num plus one
 	newVersion := operation.Config.Num
-	if operation.Config.Num > 1+kv.getCurrentVersion() || operation.Config.Num < kv.getCurrentVersion() {
-		kv.logService(true, "ERROR: Attempted to update config from %d to %d.", kv.getCurrentVersion(), operation.Config.Num)
-	} else if operation.Config.Num == kv.getCurrentVersion() {
-		kv.logConfigChange(false, kv.getCurrentVersion(), "This update in configuration has happened before, no need to apply again!")
+	if operation.Config.Num != 1+kv.getCurrentVersion() {
+		kv.logService(false, "Log entry suggests to update config from %d to %d and ignored as duplicates", kv.getCurrentVersion(), operation.Config.Num)
 	} else {
 		shardsToReceive, shardsToSend, _, shardsToInitialize := CompareConfigs(kv.gid, kv.config, operation.Config)
 		// clear the preclusion set because no longer useful
@@ -580,7 +581,7 @@ func (kv *ShardKV) applyInstallShard(operation *Op) *RpcResponse {
 	// always updates the duplicated table
 	kv.updateDuplicateTable(operation)
 	// copy the shardData to avoid writing it while the low level Raft library is reading it
-	shardDataCopy := copyMap(operation.ShardData)
+	shardDataCopy := copyShard(operation.ShardData)
 	// scenario 1: arrived earlier than the config change, simply add into the buffer for later use
 	if operation.Version > kv.getCurrentVersion() {
 		kv.shardBuffer[ShardVersion{operation.ShardId, operation.Version}] = shardDataCopy
@@ -606,7 +607,7 @@ func (kv *ShardKV) applyInstallShard(operation *Op) *RpcResponse {
 		// job exists, install the data to buffer with newVersion, note that the sending of data is done async and the send job will be removed after executed
 		newVersion := sendJobContext.NewVersion
 		kv.shardBuffer[ShardVersion{operation.ShardId, newVersion}] = shardDataCopy
-		kv.logShardReceiver(false, operation.ShardId, operation.Version, operation.SourceGid, "Install shard that the group is waiting to resend with old version %d and new version %d", operation.Version, newVersion)
+		kv.logShardReceiver(false, operation.ShardId, operation.Version, operation.SourceGid, "Install shard associated with a send job with new version %d", newVersion)
 		return &RpcResponse{
 			CommandId: CommandUniqueIdentifier{
 				Type:    INSTALLSHARD,
@@ -814,9 +815,8 @@ func (kv *ShardKV) configQueryIssuer() {
 		// increment the version by at most 1 each time
 		nextVersion := kv.getCurrentVersion() + 1
 		kv.mu.Unlock()
-		latestConfig := kv.mck.Query(nextVersion) //blocking operation so no lock
+		latestConfig := kv.mck.Query(nextVersion) // blocking operation so no lock
 		kv.mu.Lock()
-		// TODO: the same config might enter the log multiple times before the config is applied
 		if latestConfig.Num == kv.getCurrentVersion()+1 {
 			// optionally, prevent client operations on the about-to-be-removed shards from entering the log
 			// because these log entries are after the configUpdate entry. They will not be applied anyway
@@ -836,9 +836,6 @@ func (kv *ShardKV) configQueryIssuer() {
 			} else {
 				kv.logConfigChange(false, latestConfig.Num, "New Config added to the log at index %d!", indexOrLeader)
 			}
-		} else if latestConfig.Num < kv.getCurrentVersion() || latestConfig.Num > kv.getCurrentVersion()+1 {
-			// break the invariant. The linearizability of controller operations prevent it
-			kv.logService(true, "ERROR: Latest Config polled from controller has impossible version number!")
 		}
 		kv.mu.Unlock()
 	}
@@ -878,6 +875,8 @@ func (kv *ShardKV) sendShardIfAvailable(sendJob *SendJobContext) {
 	defer kv.mu.Unlock()
 	kv.mu.Lock()
 	kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Attempt to send a shard!")
+	// avoid the potential race made by read and write of duplicate table, shardData on the shard buffer is read-only, so no need to make copy
+	dupCopy := copyDuplicateTable(kv.duplicateTable)
 	// data of that version is available
 	for _, serverName := range sendJob.DestServers {
 		shardData, available := kv.shardBuffer[ShardVersion{sendJob.Shard, sendJob.NewVersion}]
@@ -894,11 +893,11 @@ func (kv *ShardKV) sendShardIfAvailable(sendJob *SendJobContext) {
 			Version:        sendJob.NewVersion,
 			Data:           shardData,
 			SourceGid:      kv.gid,
-			DuplicateTable: kv.duplicateTable,
+			DuplicateTable: dupCopy,
 		}
 		reply := new(InstallShardReply)
-		kv.mu.Unlock()
 		kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Start the RPC to send the shard to "+serverName)
+		kv.mu.Unlock()
 		ok := serverEnd.Call("ShardKV.HandleInstallShard", args, reply)
 		// it might be the case that the job is finished during waiting for reply.
 		kv.mu.Lock()
@@ -912,7 +911,7 @@ func (kv *ShardKV) sendShardIfAvailable(sendJob *SendJobContext) {
 			kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "Shard sent is rejected with error "+string(reply.Err))
 		} else {
 			op := Op{
-				Type:    FINISHSENDJOB,
+				Type:    GARBAGECOLLECT,
 				ShardId: sendJob.Shard,
 				Version: sendJob.OldVersion,
 			}
@@ -928,28 +927,6 @@ func (kv *ShardKV) sendShardIfAvailable(sendJob *SendJobContext) {
 	}
 	if sendJob.Status != Finished {
 		sendJob.Status = NotStarted
-	}
-}
-
-// Periodically clean the garbage to free some memory
-func (kv *ShardKV) garbageCollector() {
-	// In my implementation, the versioned shard and the send job will be removed
-	// after receiving the reply of successful installation from the other group
-	kv.logService(false, "Start to periodically remove the versioned shards on buffer that has already been sent to the other group...")
-	for !kv.killed() {
-		time.Sleep(time.Duration(GarbageCollectMillis) * time.Millisecond)
-		kv.mu.Lock()
-		for oldSV, sendJob := range kv.shardToSendJobs {
-			if sendJob.Status == Finished {
-				kv.logService(false, "Just GCed the shard with id %d and version %d", sendJob.Shard, sendJob.NewVersion)
-				newSV := ShardVersion{sendJob.Shard, sendJob.NewVersion}
-				if _, ok := kv.shardBuffer[newSV]; ok {
-					delete(kv.shardBuffer, newSV)
-				}
-				delete(kv.shardToSendJobs, oldSV)
-			}
-		}
-		kv.mu.Unlock()
 	}
 }
 
@@ -1104,7 +1081,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.staleRpcContextDetector()
 	go kv.configQueryIssuer()
 	go kv.sendShardScheduler()
-	go kv.garbageCollector()
 	return kv
 }
 
@@ -1153,12 +1129,22 @@ func CompareConfigs(gid int, oldConfig shardctrler.Config, newConfig shardctrler
 }
 
 // create a copy of a shard
-func copyMap(shard map[string]string) map[string]string {
+func copyShard(shard map[string]string) map[string]string {
 	copiedShard := make(map[string]string)
 	for k, v := range shard {
 		copiedShard[k] = v
 	}
 	return copiedShard
+}
+
+// create a copy of duplicate Table
+func copyDuplicateTable(dup map[int64]*RpcResponse) map[int64]*RpcResponse {
+	result := make(map[int64]*RpcResponse)
+	// don't have to make a copy of RpcResponse as it is read-only the moment after it is created
+	for k, v := range dup {
+		result[k] = v
+	}
+	return result
 }
 
 // logging functions
@@ -1208,7 +1194,7 @@ func (kv *ShardKV) logShardSender(fatal bool, shardId int, shardVersion int, des
 	if !ShardKVDebug {
 		return
 	}
-	prefix := fmt.Sprintf("Service-%d-%d Shard-%d Version-%d", kv.gid, kv.me, shardId, shardVersion)
+	prefix := fmt.Sprintf("Service-%d-%d ConfigNum-%d Shard-%d Version-%d", kv.gid, kv.me, kv.getCurrentVersion(), shardId, shardVersion)
 	if destGid < 0 {
 		prefix = prefix + ": "
 	} else {
@@ -1226,7 +1212,7 @@ func (kv *ShardKV) logShardReceiver(fatal bool, shardId int, shardVersion int, s
 	if !ShardKVDebug {
 		return
 	}
-	prefix := fmt.Sprintf("Service-%d-%d Shard-%d Version-%d", kv.gid, kv.me, shardId, shardVersion)
+	prefix := fmt.Sprintf("Service-%d-%d ConfigNum-%d Shard-%d Version-%d", kv.gid, kv.me, kv.getCurrentVersion(), shardId, shardVersion)
 	if sourceGid < 0 {
 		prefix = prefix + ": "
 	} else {

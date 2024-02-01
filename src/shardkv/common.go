@@ -8,7 +8,7 @@ import (
 )
 
 // used to control whether or not print debugging info
-const ShardKVDebug = true
+const ShardKVDebug = false
 
 // used to shorten the uid of a client for logging
 const PrefixLength = 5
@@ -33,7 +33,7 @@ const (
 	APPEND
 	INSTALLSHARD
 	INCREMENTCONFIG
-	FINISHSENDJOB
+	GARBAGECOLLECT
 )
 
 type Err string
