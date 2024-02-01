@@ -397,7 +397,7 @@ func (kv *ShardKV) applyChannelObserver() {
 			// reply if there is a matched RPC handler (i.e. the leader that talked to the client/shard sender is the current server)
 			if ok {
 				rpcContext.deliverResponseAndNotify(response)
-				kv.logClientRPC(false, response.ClerkId, response.SeqNum, "Notify the RPC handler with the reply message!")
+				kv.logService(false, "Notify the RPC handler with the reply message for index %d!", applyMsg.CommandIndex)
 			}
 			kv.mu.Unlock()
 		} else if applyMsg.SnapshotValid {
@@ -443,34 +443,7 @@ func (kv *ShardKV) validateAndApply(operation *Op) *RpcResponse {
 		return nil // finish send job does not have associated RPC handler
 	}
 	// Scenario 4: clientOperation
-	cachedEntry, ok := kv.duplicateTable[operation.ClerkId]
-	// not outdated or duplicated
-	var response *RpcResponse
-	if !ok || cachedEntry.SeqNum < operation.SeqNum {
-		response = kv.applyClientOperation(operation)
-		// store the result (especially GET) to duplicateTable
-		kv.duplicateTable[operation.ClerkId] = response // by pointer assign to duplicateTable
-	} else if cachedEntry.SeqNum == operation.SeqNum {
-		// duplicated, need to resend reply
-		response = cachedEntry
-		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Executed command found in applyClientOperation channel and must reply again")
-	} else {
-		// lagged behind operation, the response will be ignored by clerk because the clerk has received reply
-		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Executed command found in applyClientOperation channel and the client"+
-			" is guaranteed to have seen the response! Simply ignored!")
-		// just return an empty response as the client is guaranteed to see the response already
-		// it will be discarded by the clerk anyway
-		response = &RpcResponse{
-			ClerkId: operation.ClerkId,
-			SeqNum:  operation.SeqNum,
-			CommandId: CommandUniqueIdentifier{
-				Type:    operation.Type,
-				ClerkId: operation.ClerkId,
-				SeqNum:  operation.SeqNum,
-			},
-			Err: OK,
-		}
-	}
+	response := kv.validateAndApplyClientOperation(operation)
 	return response
 }
 
@@ -522,7 +495,7 @@ func (kv *ShardKV) validateAndApplyIncrementConfig(operation *Op) {
 					OldVersion:  oldVersionExpected,
 					NewVersion:  newVersion,
 					DestGID:     destGid,
-					DestServers: kv.getServerNames(destGid),
+					DestServers: operation.Config.Groups[destGid],
 				}
 			} else {
 				// shard already in the stateMachine
@@ -536,7 +509,7 @@ func (kv *ShardKV) validateAndApplyIncrementConfig(operation *Op) {
 					OldVersion:  newVersion,
 					NewVersion:  newVersion,
 					DestGID:     destGid,
-					DestServers: kv.getServerNames(destGid),
+					DestServers: operation.Config.Groups[destGid],
 				}
 			}
 			kv.logShardSender(false, shardId, newVersion, destGid, "Produced a job to send shard")
@@ -685,6 +658,71 @@ func (kv *ShardKV) updateDuplicateTable(operation *Op) {
 	}
 }
 
+// Check if the operation should be applied (e.g. check shard ownership and duplicate table) and apply
+func (kv *ShardKV) validateAndApplyClientOperation(operation *Op) *RpcResponse {
+	if operation == nil {
+		kv.logService(true, "ERROR: The operation to execute is a nil pointer!")
+	}
+	// create a skeleton for response
+	errResponse := &RpcResponse{
+		ClerkId: operation.ClerkId,
+		SeqNum:  operation.SeqNum,
+		CommandId: CommandUniqueIdentifier{
+			Type:    operation.Type,
+			ClerkId: operation.ClerkId,
+			SeqNum:  operation.SeqNum,
+		},
+	}
+	shardID := key2shard(operation.Key)
+	// check if the shard the command is operated on is managed by the current config
+	if kv.gid != kv.config.Shards[shardID] {
+		errResponse.Err = ErrWrongGroup
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Client operation replicated in log but not executed because in current config %d gid to serve shard %d is %d!",
+			kv.getCurrentVersion(), shardID, kv.config.Shards[shardID])
+		// check invariance: the stateMachine must not possess the data that the current config does not manage
+		if _, exists := kv.shardedStateMachines[shardID]; exists {
+			kv.logClientRPC(true, operation.ClerkId, operation.SeqNum, "Shard %d not served in the group %d for config %d appear in state machine", shardID, kv.gid, kv.getCurrentVersion())
+		}
+		return errResponse
+	}
+	// check if the data is ready (received from other group) by checking if the shard is in the map
+	if _, exists := kv.shardedStateMachines[shardID]; !exists {
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Try to execute client command but the shard %d is not ready!", shardID)
+		errResponse.Err = ErrShardNotReady
+		return errResponse
+	}
+	// when the data is ready, check the duplicate table first
+	cachedEntry, ok := kv.duplicateTable[operation.ClerkId]
+	// not outdated or duplicated
+	var response *RpcResponse
+	if !ok || cachedEntry.SeqNum < operation.SeqNum {
+		response = kv.applyClientOperation(operation)
+		// store the result (especially GET) to duplicateTable
+		kv.duplicateTable[operation.ClerkId] = response // by pointer assign to duplicateTable
+	} else if cachedEntry.SeqNum == operation.SeqNum {
+		// duplicated, need to resend reply
+		response = cachedEntry
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Executed command found in applyClientOperation channel and must reply again")
+	} else {
+		// lagged behind operation, the response will be ignored by clerk because the clerk has received reply
+		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Executed command found in applyClientOperation channel and the client"+
+			" is guaranteed to have seen the response! Simply ignored!")
+		// just return an empty response as the client is guaranteed to see the response already
+		// it will be discarded by the clerk anyway
+		response = &RpcResponse{
+			ClerkId: operation.ClerkId,
+			SeqNum:  operation.SeqNum,
+			CommandId: CommandUniqueIdentifier{
+				Type:    operation.Type,
+				ClerkId: operation.ClerkId,
+				SeqNum:  operation.SeqNum,
+			},
+			Err: OK,
+		}
+	}
+	return response
+}
+
 // Apply the operation to the in-memory kv stateMachine and put the result into kv.replyEntry
 func (kv *ShardKV) applyClientOperation(operation *Op) *RpcResponse {
 	if operation == nil {
@@ -700,23 +738,6 @@ func (kv *ShardKV) applyClientOperation(operation *Op) *RpcResponse {
 		},
 	}
 	shardID := key2shard(operation.Key)
-	// check if the shard the command is operated on is managed by the current config
-	if kv.gid != kv.config.Shards[shardID] {
-		response.Err = ErrWrongGroup
-		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Client operation replicated in log but not executed because in current config %d gid to serve shard %d is %d!",
-			kv.getCurrentVersion(), shardID, kv.config.Shards[shardID])
-		// check invariance: the stateMachine must not possess the data that the current config does not manage
-		if _, exists := kv.shardedStateMachines[shardID]; exists {
-			kv.logClientRPC(true, operation.ClerkId, operation.SeqNum, "Shard %d not served in the group %d for config %d appear in state machine", shardID, kv.gid, kv.getCurrentVersion())
-		}
-		return response
-	}
-	// check if the data is ready (received from other group) by checking if the shard is in the map
-	if _, exists := kv.shardedStateMachines[shardID]; !exists {
-		kv.logClientRPC(false, operation.ClerkId, operation.SeqNum, "Try to execute client command but the shard %d is not ready!", shardID)
-		response.Err = ErrShardNotReady
-		return response
-	}
 	switch operation.Type {
 	case GET:
 		val, ok := kv.shardedStateMachines[shardID][operation.Key]
@@ -862,7 +883,9 @@ func (kv *ShardKV) sendShardIfAvailable(sendJob *SendJobContext) {
 		shardData, available := kv.shardBuffer[ShardVersion{sendJob.Shard, sendJob.NewVersion}]
 		if !available {
 			kv.logShardSender(false, sendJob.Shard, sendJob.NewVersion, sendJob.DestGID, "The shard data is not in buffer so can't be sent!")
-			sendJob.Status = NotStarted
+			if sendJob.Status != Finished {
+				sendJob.Status = NotStarted
+			}
 			return
 		}
 		serverEnd := kv.makeEnd(serverName)
@@ -1127,9 +1150,6 @@ func CompareConfigs(gid int, oldConfig shardctrler.Config, newConfig shardctrler
 		}
 	}
 	return shardsToReceive, shardsToSend, noChangeShards, shardsToInitialize
-}
-func (kv *ShardKV) getServerNames(gid int) []string {
-	return kv.config.Groups[gid]
 }
 
 // create a copy of a shard

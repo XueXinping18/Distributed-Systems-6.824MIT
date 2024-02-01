@@ -8,7 +8,7 @@ import (
 )
 
 // used to control whether or not print debugging info
-const ShardKVDebug = false
+const ShardKVDebug = true
 
 // used to shorten the uid of a client for logging
 const PrefixLength = 5
