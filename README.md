@@ -14,31 +14,31 @@ This repository contains my solutions for the MIT 6.824 Distributed Systems cour
 
 ### Lab 2: Raft Consensus Algorithm (finished)
 - **Subsections:**
-  - **Lab 2A: Raft Leader Election**
+  - **Lab 2A: Raft Leader Election** (finished)
     - Implementing leader election within the Raft consensus framework.
-  - **Lab 2B: Raft Log Entries Append**
+  - **Lab 2B: Raft Log Entries Append** (finished)
     - Managing log entries, replication, and maintaining consistency among followers.
-  - **Lab 2C: Raft State Persistence**
+  - **Lab 2C: Raft State Persistence** (finished)
     - Ensuring the durability and automatic recoverability of the Raft states in case server encounters fail-stop faults.
-  - **Lab 2D: Raft Log Compaction**
+  - **Lab 2D: Raft Log Compaction** (finished)
     - Implementing log compaction in Raft to handle growing log sizes and reduce time to recover states on restarts.
 - **Similar Industry Middleware:** Apache ZooKeeper, etcd.
 
 ### Lab 3: Fault-tolerant Key/Value Service (finished)
 - **Subsections:**
-  - **Lab 3A: Key/Value Service Without Snapshots**
+  - **Lab 3A: Key/Value Service Without Snapshots** (finished)
     - Building a key/value store on Raft to achieve strong consistency among replicated state machines, featured with mechanisms for duplication detection and handling of stale requests.
-  - **Lab 3B: Key/Value Service With Snapshots**
+  - **Lab 3B: Key/Value Service With Snapshots** (finished)
     - Enhancing the key/value store with snapshot functionality for efficient state management.
 - **Similar Industry Middleware:** Redis, Amazon DynamoDB.
 
-### Lab 4: Sharded Key/Value Service (ongoing)
+### Lab 4: Sharded Key/Value Service (finished)
 - **Subsections:**
-  - **Part A: The Shard Controller**
+  - **Part A: The Shard Controller** (finished)
     - Developing a shard controller to manage configurations and shard assignments among replica groups.
-  - **Part B: Sharded Key/Value Server**
+  - **Part B: Sharded Key/Value Server** (finished)
     - Creating a sharded, fault-tolerant key/value storage system, ensuring linearizable client interaction even amidst configuration changes.
-  - **Additional Challenges:**
+  - **Additional Challenges:** (finished)
     - Implementing garbage collection of state and managing client requests during configuration transitions.
 - **Similar Industry Middleware:** MongoDB Sharded Clusters, Google Cloud Bigtable.
 
