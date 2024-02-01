@@ -65,7 +65,15 @@ func (ck *Clerk) selectServer(args *KVOperationArgs, mustRefreshConfig bool) (*l
 	shard := key2shard(args.Key)
 	gid := ck.config.Shards[shard]
 	servers := ck.config.Groups[gid]
-	for gid == 0 || len(servers) == 0 || mustRefreshConfig {
+	// refresh the server once if required
+	if mustRefreshConfig {
+		ck.config = ck.sm.Query(-1)
+		gid = ck.config.Shards[shard]
+		servers = ck.config.Groups[gid]
+		ck.preferredServer = -1 // reset the server
+	}
+	// refresh until there is at least one available server
+	for gid == 0 || len(servers) == 0 {
 		time.Sleep(100 * time.Millisecond)
 		ck.config = ck.sm.Query(-1) // fetch the newest config
 		gid = ck.config.Shards[shard]
@@ -211,7 +219,7 @@ func (ck *Clerk) logRPC(fatal bool, seqNum int, gid int, serverId int, format st
 	}
 	prefixClerk := "Clerk-" + ck.base64IdPrefix + " "
 	prefixSeq := fmt.Sprintf("Seq-%d ", seqNum)
-	prefixService := fmt.Sprintf("ServiceHandle-%d-%d: ", gid, serverId)
+	prefixService := fmt.Sprintf("ServiceHandle-%d-%d ConfigNum-%d: ", gid, serverId, ck.config.Num)
 	message := fmt.Sprintf(format, args...)
 	if fatal {
 		log.Fatalln(prefixClerk + prefixSeq + prefixService + message)
