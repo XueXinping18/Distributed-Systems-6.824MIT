@@ -1165,7 +1165,7 @@ func copyMap(shard map[string]string) map[string]string {
 // 1. logging info regarding the service itself
 func (kv *ShardKV) logService(fatal bool, format string, args ...interface{}) {
 	if ShardKVDebug {
-		prefix := fmt.Sprintf("Service-%d-%d: ", kv.gid, kv.me)
+		prefix := fmt.Sprintf("Service-%d-%d ConfigNum-%d: ", kv.gid, kv.me, kv.getCurrentVersion())
 		if fatal {
 			log.Fatalf(prefix+format+"\n", args...)
 		} else {
@@ -1179,7 +1179,7 @@ func (kv *ShardKV) logClientRPC(fatal bool, clerkId int64, seqNum int, format st
 	if ShardKVDebug {
 		// convert id to base64 and take a prefix for logging purpose
 		clerkStr := base64Prefix(clerkId)
-		prefixService := fmt.Sprintf("Service-%d-%d ", kv.gid, kv.me)
+		prefixService := fmt.Sprintf("Service-%d-%d ConfigNum-%d ", kv.gid, kv.me, kv.getCurrentVersion())
 		prefixClerk := "Clerk-" + clerkStr + " "
 		prefixSeq := fmt.Sprintf("Seq-%d: ", seqNum)
 		fmtString := fmt.Sprintf(format, args...)
