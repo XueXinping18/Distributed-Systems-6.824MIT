@@ -128,6 +128,9 @@ func (ck *Clerk) KVOperation(args *KVOperationArgs) string {
 			case ErrWrongLeader:
 				ck.logRPC(false, seqNum, serverId, "Client notified that the server is not leader, retry another server!")
 				ck.preferredServer = -1
+			case ErrTermChanged:
+				ck.logRPC(false, seqNum, serverId, "Client notified that the term has changed before the execution of command, retry another server!")
+				ck.preferredServer = -1
 			case ErrNoKey:
 				ck.preferredServer = serverId
 				// success

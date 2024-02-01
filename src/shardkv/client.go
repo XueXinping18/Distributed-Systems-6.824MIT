@@ -138,6 +138,10 @@ func (ck *Clerk) KVOperation(args *KVOperationArgs) string {
 				ck.logRPC(false, seqNum, gid, serverId, "Client notified that the server is not leader, retry another server!")
 				refreshConfig = false
 				ck.preferredServer = -1
+			case ErrTermChanged:
+				ck.logRPC(false, seqNum, gid, serverId, "Client notified that the term has changed before the execution of command, retry!")
+				refreshConfig = false
+				ck.preferredServer = -1
 			case ErrNoKey:
 				refreshConfig = false
 				ck.preferredServer = serverId
