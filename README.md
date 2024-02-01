@@ -49,7 +49,7 @@ Logging by default is turned off. For detailed logging related to clients, servi
 
 ## Implementation Details 
 
-Each section has its own documentation for implementation (ongoing).
+Lab 1 has been provided documentation. Lab 2, 3, and 4 has been finished and documentation are still unfinished.
 Also, substantial comments are supplied in my code to explain how different scenarios are handled in my design, and why alternative designs might be problematic, etc.
 
 ## Skills and Concepts Acquired
