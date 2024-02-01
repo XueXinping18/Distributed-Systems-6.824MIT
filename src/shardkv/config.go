@@ -94,11 +94,11 @@ func (cfg *config) checklogs() {
 			raft := cfg.groups[gi].saved[i].RaftStateSize()
 			snap := len(cfg.groups[gi].saved[i].ReadSnapshot())
 			if cfg.maxraftstate >= 0 && raft > 8*cfg.maxraftstate {
-				cfg.t.Fatalf("persister.RaftStateSize() %v, but maxraftstate %v",
+				cfg.t.Fatalf("persister.RaftStateSize() %v, but maxRaftState %v",
 					raft, cfg.maxraftstate)
 			}
 			if cfg.maxraftstate < 0 && snap > 0 {
-				cfg.t.Fatalf("maxraftstate is -1, but snapshot is non-empty!")
+				cfg.t.Fatalf("maxRaftState is -1, but snapshot is non-empty!")
 			}
 		}
 	}

@@ -105,10 +105,10 @@ func (ck *Clerk) ControllerOperation(args *ControllerOperationArgs) *Config {
 		// decide which leader to choose
 		if ck.preferredServer == -1 {
 			serverId = ck.chooseRandomServer()
-			ck.logRPC(false, seqNum, serverId, "Decide to select server handle %d in random", serverId)
+			ck.logControllerRPC(false, seqNum, serverId, "Decide to select server handle %d in random", serverId)
 		} else {
 			serverId = ck.preferredServer
-			ck.logRPC(false, seqNum, serverId, "Decide to select server handle %d as previously did", serverId)
+			ck.logControllerRPC(false, seqNum, serverId, "Decide to select server handle %d as previously did", serverId)
 		}
 		// Doing RPC to the server.
 		// Note that serverId in client side and server side is different for the same server
@@ -117,21 +117,24 @@ func (ck *Clerk) ControllerOperation(args *ControllerOperationArgs) *Config {
 		// handle the RPC reply and potentially retry, update the preferred server to send
 		if !ok {
 			// message lost, retry with a random server
-			ck.logRPC(false, seqNum, serverId, "Message Lost in traffic (either request or response)")
+			ck.logControllerRPC(false, seqNum, serverId, "Message Lost in traffic (either request or response)")
 			ck.preferredServer = -1
 		} else {
 			// decide what action to do according to error term, validate invariance
 			switch reply.Err {
+			case ErrTermChanged:
+				ck.logControllerRPC(false, seqNum, serverId, "Client notified that the term has changed before the execution of command, retry another server!")
+				ck.preferredServer = -1
 			case ErrLogEntryErased:
-				ck.logRPC(false, seqNum, serverId, "Client notified that log entry has been erased, retry!")
+				ck.logControllerRPC(false, seqNum, serverId, "Client notified that log entry has been erased, retry!")
 				ck.preferredServer = -1
 			case ErrWrongLeader:
-				ck.logRPC(false, seqNum, serverId, "Client notified that the server is not leader, retry another server!")
+				ck.logControllerRPC(false, seqNum, serverId, "Client notified that the server is not leader, retry another server!")
 				ck.preferredServer = -1
 			case OK:
 				ck.preferredServer = serverId
 				// success
-				ck.logRPC(false, seqNum, serverId, "The request returns successfully!")
+				ck.logControllerRPC(false, seqNum, serverId, "The request returns successfully!")
 				done = true // break the loop
 			}
 		}
@@ -152,7 +155,7 @@ func (ck *Clerk) logAdmin(fatal bool, format string, args ...interface{}) {
 		log.Println(prefix + message)
 	}
 }
-func (ck *Clerk) logRPC(fatal bool, seqNum int, serverId int, format string, args ...interface{}) {
+func (ck *Clerk) logControllerRPC(fatal bool, seqNum int, serverId int, format string, args ...interface{}) {
 	if !ControllerDebug {
 		return
 	}
