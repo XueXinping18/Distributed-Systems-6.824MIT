@@ -47,10 +47,6 @@ This repository contains my solutions for the MIT 6.824 Distributed Systems cour
 Please refer to the official course website (http://nil.csail.mit.edu/6.824/2022/schedule.html)
 Logging by default is turned off. For detailed logging related to clients, services or Raft instances, consider to switch the corresponding Debug variable to true.
 
-## Implementation Details 
-
-Lab 1 has been provided documentation. Lab 2, 3, and 4 has been finished and documentation are still unfinished.
-Also, substantial comments are supplied in my code to explain how different scenarios are handled in my design, and why alternative designs might be problematic, etc.
 
 ## Skills and Concepts Acquired
 
